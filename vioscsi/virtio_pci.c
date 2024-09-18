@@ -113,7 +113,9 @@ static void *mem_alloc_contiguous_pages(void *context, size_t size)
         RtlZeroMemory(ptr, size);
         return ptr;
     } else {
+        #if !defined(RUN_UNCHECKED) || defined(RUN_MIN_CHECKED)
         RhelDbgPrint(TRACE_LEVEL_FATAL, " Ran out of memory in alloc_pages_exact(%Id)\n", size);
+        #endif
         return NULL;
     }
 }

@@ -46,13 +46,34 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 #define VIRTIO_SCSI_SENSE_SIZE 96
 
 #ifndef NTDDI_WINTHRESHOLD
-#define NTDDI_WINTHRESHOLD                  0x0A000000  /* ABRACADABRA_THRESHOLD */
+#define NTDDI_WINTHRESHOLD      0x0A000000  /* ABRACADABRA_THRESHOLD */
 #endif
+
+#ifndef NTDDI_WIN10_NI
+#define NTDDI_WIN10_NI          0x0A00000C
+#define NTDDI_WIN10_CU          0x0A00000D
+#endif
+
+#ifndef NTDDI_WIN11
+#define NTDDI_WIN11             NTDDI_WIN10_CO
+#define NTDDI_WIN11_CO          NTDDI_WIN10_CO  // Windows 10.0.21277-22000  / Cobalt       / 21H2
+#define NTDDI_WIN11_NI          NTDDI_WIN10_NI  // Windows 10.0.22449-22631  / Nickel       / 22H2 23H2
+#define NTDDI_WIN11_CU          NTDDI_WIN10_CU  // Windows 10.0.25057-25236  / Copper
+#define NTDDI_WIN11_ZN          0x0A00000E      // Windows 10.0.25246-25398  / Zinc
+#define NTDDI_WIN11_GA          0x0A00000F      // Windows 10.0.25905-25941  / Gallium
+#define NTDDI_WIN11_GE          0x0A000010      // Windows 10.0.25947-26100  / Germanium    / 24H2
+#endif
+
+#define NTDDI_THRESHOLD         NTDDI_WINTHRESHOLD
 
 #define PHYS_SEGMENTS           32
 #define MAX_PHYS_SEGMENTS       512
 #define VIOSCSI_POOL_TAG        'SoiV'
-#define VIRTIO_MAX_SG            (1+1+MAX_PHYS_SEGMENTS+1) //cmd + resp + (MAX_PHYS_SEGMENTS + extra_page)
+// ALL of these work...
+//#define VIRTIO_MAX_SG            (1+1+MAX_PHYS_SEGMENTS+1) //cmd + resp + (MAX_PHYS_SEGMENTS + extra_page)
+//#define VIRTIO_MAX_SG            (MAX_PHYS_SEGMENTS+VIRTIO_SCSI_REQUEST_QUEUE_0+VIRTIO_SCSI_MSI_CONTROL_Q_OFFSET) //cmd + resp + (MAX_PHYS_SEGMENTS + extra_page)
+#define VIRTIO_MAX_SG            (MAX_PHYS_SEGMENTS+VIRTIO_SCSI_REQUEST_QUEUE_0) //cmd + resp + MAX_PHYS_SEGMENTS
+//#define VIRTIO_MAX_SG            MAX_PHYS_SEGMENTS // This should really be enough
 
 #define SECTOR_SIZE             512
 #define IO_PORT_LENGTH          0x40
@@ -61,7 +82,8 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 #define REGISTRY_MAX_PH_BREAKS           "PhysicalBreaks"
 #define REGISTRY_ACTION_ON_RESET         "VioscsiActionOnReset"
 #define REGISTRY_RESP_TIME_LIMIT         "TraceResponseTime"
-
+#define REGISTRY_ALLOC_FOR_CPU_HOTPLUG   "AllocForCpuHotplug"
+#define REGISTRY_USE_DMA32BITADDRESSES   "UseDma32BitAddresses"
 
 /* Feature Bits */
 #define VIRTIO_SCSI_F_INOUT                    0
@@ -118,11 +140,13 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 #define VIRTIO_SCSI_CONTROL_QUEUE              0
 #define VIRTIO_SCSI_EVENTS_QUEUE               1
 #define VIRTIO_SCSI_REQUEST_QUEUE_0            2
-#define VIRTIO_SCSI_QUEUE_LAST                 VIRTIO_SCSI_REQUEST_QUEUE_0 + MAX_CPU
+//#define VIRTIO_SCSI_QUEUE_LAST                 VIRTIO_SCSI_REQUEST_QUEUE_0 + MAX_CPU
+#define VIRTIO_SCSI_QUEUE_LAST                 (MAX_CPU - VIRTIO_SCSI_REQUEST_QUEUE_0)
 
 /* MSI messages and virtqueue indices are offset by 1, MSI 0 is not used */
-#define QUEUE_TO_MESSAGE(QueueId)              ((QueueId) + 1)
-#define MESSAGE_TO_QUEUE(MessageId)            ((MessageId) - 1)
+#define VIRTIO_SCSI_MSI_CONTROL_Q_OFFSET       1
+#define QUEUE_TO_MESSAGE(QueueId)              ((QueueId) + VIRTIO_SCSI_MSI_CONTROL_Q_OFFSET)
+#define MESSAGE_TO_QUEUE(MessageId)            ((MessageId) - VIRTIO_SCSI_MSI_CONTROL_Q_OFFSET)
 
 /* SCSI command request, followed by data-out */
 #pragma pack(1)
@@ -322,8 +346,11 @@ typedef struct _ADAPTER_EXTENSION {
     ULONG                 perfFlags;
     PGROUP_AFFINITY       pmsg_affinity;
     ULONG                 num_affinity;
+    ULONG                 alloc_for_cpu_hotplug;
+    ULONG                 use_Dma32BitAddresses;
     BOOLEAN               dpc_ok;
     PSTOR_DPC             dpc;
+    ULONG                 max_segments;
     ULONG                 max_physical_breaks;
     SCSI_WMILIB_CONTEXT   WmiLibContext;
     ULONGLONG             hba_id;

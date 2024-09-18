@@ -49,6 +49,12 @@
 #define CACHE_LINE_SIZE 64
 #define ROUND_TO_CACHE_LINES(Size)  (((ULONG_PTR)(Size) + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1))
 
+#define VQ_ADD_BUFFER_SUCCESS 0
+
+#define MSIXLock 0
+#define VIOSCSI_VQLOCKOP_UNLOCK 0
+#define VIOSCSI_VQLOCKOP_LOCK 1
+
 #include <srbhelper.h>
 
 // Note: SrbGetCdbLength is defined in srbhelper.h
@@ -103,7 +109,8 @@ SrbGetPnpInfo(_In_ PVOID Srb, ULONG* PnPFlags, ULONG* PnPAction) {
 VOID
 SendSRB(
     IN PVOID DeviceExtension,
-    IN PSRB_TYPE Srb
+    IN PSRB_TYPE Srb,
+    IN STOR_SPINLOCK LockMode
     );
 
 BOOLEAN
@@ -167,38 +174,47 @@ VioScsiCompleteDpcRoutine(
     IN PVOID Context,
     IN PVOID SystemArgument1,
     IN PVOID SystemArgument2
-);
+    );
 
-VOID
+BOOLEAN
+FORCEINLINE
 ProcessQueue(
-    IN PVOID DeviceExtension,
-    IN ULONG MessageID,
-    IN BOOLEAN isr
+    IN PVOID  DeviceExtension,
+    IN ULONG  MessageId,
+    IN PVOID InlineFuncName
     );
 
 VOID
-//FORCEINLINE
-VioScsiVQLock(
+ProcessBuffer(
     IN PVOID DeviceExtension,
-    IN ULONG MessageID,
+    IN ULONG MessageId,
+    IN STOR_SPINLOCK LockMode
+    );
+
+VOID
+VioScsiSpinLockManager(
+    IN PVOID DeviceExtension,
+    IN ULONG MessageId,
     IN OUT PSTOR_LOCK_HANDLE LockHandle,
-    IN BOOLEAN isr
+    IN STOR_SPINLOCK LockMode,
+    IN BOOLEAN LockOp
     );
 
-VOID
-//FORCEINLINE
-VioScsiVQUnlock(
+ULONG
+VioScsiSpinLockManagerEx(
     IN PVOID DeviceExtension,
-    IN ULONG MessageID,
-    IN PSTOR_LOCK_HANDLE LockHandle,
-    IN BOOLEAN isr
+    IN ULONG MessageId,
+    IN OUT PSTOR_LOCK_HANDLE LockHandle,
+    IN STOR_SPINLOCK LockMode,
+    IN BOOLEAN LockOp
     );
 
 VOID
-//FORCEINLINE
+FORCEINLINE
 HandleResponse(
     IN PVOID DeviceExtension,
-    IN PVirtIOSCSICmd cmd
+    IN PVirtIOSCSICmd cmd,
+    IN PVOID InlineFuncName
     );
 
 PVOID
@@ -211,7 +227,7 @@ VOID
 CompleteRequest(
     IN PVOID DeviceExtension,
     IN PSRB_TYPE Srb
- );
+    );
 
 VOID FirmwareRequest(
     IN PVOID DeviceExtension,
