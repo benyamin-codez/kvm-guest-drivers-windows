@@ -113,7 +113,9 @@ static void *mem_alloc_contiguous_pages(void *context, size_t size)
         RtlZeroMemory(ptr, size);
         return ptr;
     } else {
+        #if !defined(RUN_UNCHECKED) || defined(RUN_MIN_CHECKED)
         RhelDbgPrint(TRACE_LEVEL_FATAL, " Ran out of memory in alloc_pages_exact(%Id)\n", size);
+        #endif
         return NULL;
     }
 }
@@ -189,7 +191,7 @@ static void *pci_map_address_range(void *context, int bar, size_t offset, size_t
                 adaptExt->system_io_bus_number,
                 pBar->BasePA,
                 pBar->uLength,
-                !!pBar->bPortSpace);
+                !pBar->bMemorySpace);
         }
         if (pBar->pBase != NULL && offset < pBar->uLength) {
             return (PUCHAR)pBar->pBase + offset;

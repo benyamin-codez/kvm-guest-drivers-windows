@@ -46,22 +46,50 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 #define VIRTIO_SCSI_SENSE_SIZE 96
 
 #ifndef NTDDI_WINTHRESHOLD
-#define NTDDI_WINTHRESHOLD                  0x0A000000  /* ABRACADABRA_THRESHOLD */
+#define NTDDI_WINTHRESHOLD      0x0A000000  /* ABRACADABRA_THRESHOLD */
 #endif
 
+#ifndef NTDDI_WIN10_NI
+#define NTDDI_WIN10_NI          0x0A00000C
+#define NTDDI_WIN10_CU          0x0A00000D
+#endif
+
+#ifndef NTDDI_WIN11
+#define NTDDI_WIN11             NTDDI_WIN10_CO
+#define NTDDI_WIN11_CO          NTDDI_WIN10_CO  // Windows 10.0.21277-22000  / Cobalt       / 21H2
+#define NTDDI_WIN11_NI          NTDDI_WIN10_NI  // Windows 10.0.22449-22631  / Nickel       / 22H2 23H2
+#define NTDDI_WIN11_CU          NTDDI_WIN10_CU  // Windows 10.0.25057-25236  / Copper
+#define NTDDI_WIN11_ZN          0x0A00000E      // Windows 10.0.25246-25398  / Zinc
+#define NTDDI_WIN11_GA          0x0A00000F      // Windows 10.0.25905-25941  / Gallium
+#define NTDDI_WIN11_GE          0x0A000010      // Windows 10.0.25947-26100  / Germanium    / 24H2
+#endif
+
+#define NTDDI_THRESHOLD         NTDDI_WINTHRESHOLD
+
 #define PHYS_SEGMENTS           32
-#define MAX_PHYS_SEGMENTS       512
+#define PHYS_SEGMENTS_LIMIT     512
 #define VIOSCSI_POOL_TAG        'SoiV'
-#define VIRTIO_MAX_SG            (1+1+MAX_PHYS_SEGMENTS+1) //cmd + resp + (MAX_PHYS_SEGMENTS + extra_page)
+// ALL of these work...
+//#define VIRTIO_MAX_SG           (1+1+PHYS_SEGMENTS_LIMIT+1) //cmd + resp + (PHYS_SEGMENTS_LIMIT + extra_page)
+//#define VIRTIO_MAX_SG           (PHYS_SEGMENTS_LIMIT+VIRTIO_SCSI_REQUEST_QUEUE_0+VIRTIO_SCSI_MSI_CONTROL_Q_OFFSET) //cmd + resp + (PHYS_SEGMENTS_LIMIT + extra_page)
+//define VIRTIO_MAX_SG           (PHYS_SEGMENTS_LIMIT+VIRTIO_SCSI_REQUEST_QUEUE_0) //cmd + resp + PHYS_SEGMENTS_LIMIT
+#define VIRTIO_MAX_SG           (PHYS_SEGMENTS_LIMIT+1) // This should really be enough
 
 #define SECTOR_SIZE             512
 #define IO_PORT_LENGTH          0x40
 #define MAX_CPU                 256
 
+#define REGISTRY_BUSTYPE                 "BusType"
 #define REGISTRY_MAX_PH_BREAKS           "PhysicalBreaks"
+#define REGISTRY_MAX_PH_SEGMENTS         "MaxPhysicalSegments"
+#define REGISTRY_FACTOR8_REMAP           "PerformFactor8Remap"
 #define REGISTRY_ACTION_ON_RESET         "VioscsiActionOnReset"
 #define REGISTRY_RESP_TIME_LIMIT         "TraceResponseTime"
-
+#define REGISTRY_ALLOC_FOR_CPU_HOTPLUG   "AllocForCpuHotplug"
+#define REGISTRY_ONLY_DMA32BITADDRESSES  "OnlyDma32BitAddresses"
+#define REGISTRY_INITIATOR_BUS_ID        "InitiatorBusId"
+#define REGISTRY_WRITE_TEST              0
+#define REGISTRY_BUSTYPE_DEFAULT         0xA // BusTypeSas
 
 /* Feature Bits */
 #define VIRTIO_SCSI_F_INOUT                    0
@@ -118,11 +146,14 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 #define VIRTIO_SCSI_CONTROL_QUEUE              0
 #define VIRTIO_SCSI_EVENTS_QUEUE               1
 #define VIRTIO_SCSI_REQUEST_QUEUE_0            2
-#define VIRTIO_SCSI_QUEUE_LAST                 VIRTIO_SCSI_REQUEST_QUEUE_0 + MAX_CPU
+#define VIRTIO_SCSI_QUEUE_LAST                 (MAX_CPU - VIRTIO_SCSI_REQUEST_QUEUE_0)
 
 /* MSI messages and virtqueue indices are offset by 1, MSI 0 is not used */
-#define QUEUE_TO_MESSAGE(QueueId)              ((QueueId) + 1)
-#define MESSAGE_TO_QUEUE(MessageId)            ((MessageId) - 1)
+#define VIRTIO_SCSI_MSI_CONTROL_Q_OFFSET       1
+#define QUEUE_TO_MESSAGE(QueueId)              ((QueueId) + VIRTIO_SCSI_MSI_CONTROL_Q_OFFSET)
+#define MESSAGE_TO_QUEUE(MessageId)            ((MessageId) - VIRTIO_SCSI_MSI_CONTROL_Q_OFFSET)
+
+#define VIRTIO_WMI_ENABLE_MULTI_HBA            0
 
 /* SCSI command request, followed by data-out */
 #pragma pack(1)
@@ -271,7 +302,7 @@ typedef struct virtio_bar {
     PHYSICAL_ADDRESS  BasePA;
     ULONG             uLength;
     PVOID             pBase;
-    BOOLEAN           bPortSpace;
+    BOOLEAN           bMemorySpace;
 } VIRTIO_BAR, *PVIRTIO_BAR;
 
 typedef enum ACTION_ON_RESET {
@@ -301,6 +332,8 @@ typedef struct _ADAPTER_EXTENSION {
     VIRTIO_BAR            pci_bars[PCI_TYPE0_ADDRESSES];
     ULONG                 system_io_bus_number;
     ULONG                 slot_number;
+    ULONG                 bus_type_reg;
+    ULONG                 initiator_bus_id;        
 
     ULONG                 queue_depth;
     BOOLEAN               dump_mode;
@@ -322,9 +355,12 @@ typedef struct _ADAPTER_EXTENSION {
     ULONG                 perfFlags;
     PGROUP_AFFINITY       pmsg_affinity;
     ULONG                 num_affinity;
+    ULONG                 alloc_for_cpu_hotplug;
+    ULONG                 OnlyDma32BitAddresses;
     BOOLEAN               dpc_ok;
     PSTOR_DPC             dpc;
-    ULONG                 max_physical_breaks;
+    ULONG                 max_segments;
+    ULONG                 factor8_remap;
     SCSI_WMILIB_CONTEXT   WmiLibContext;
     ULONGLONG             hba_id;
     PUCHAR                ser_num;
@@ -365,6 +401,58 @@ typedef struct {
   PCIX_TABLE_POINTER      MessageTable;
   PCIX_TABLE_POINTER      PBATable;
 } PCI_MSIX_CAPABILITY, *PPCI_MSIX_CAPABILITY;
+#endif
+
+struct virtio_pci_cfg_cap {
+    struct virtio_pci_cap cap;
+    u8 pci_cfg_data[4]; /* Data for BAR access. */
+};
+
+struct virtio_pci_isr_cap {
+    struct virtio_pci_cap cap;
+    u8 isr;
+};
+
+struct virtio_pci_device_cap {
+    struct virtio_pci_cap cap;
+    // Be careful not to touch anything hot here...
+};
+
+struct virtio_pci_common_cfg_cap{
+    struct virtio_pci_cap cap;
+    struct virtio_pci_common_cfg;
+};
+
+typedef struct virtio_pci_notify_cap VIRTIO_PCI_NOTIFY_CAP;
+typedef VIRTIO_PCI_NOTIFY_CAP* PVIRTIO_PCI_NOTIFY_CAP;
+typedef struct virtio_pci_cfg_cap VIRTIO_PCI_CFG_CAP;
+typedef VIRTIO_PCI_CFG_CAP* PVIRTIO_PCI_CFG_CAP;
+typedef struct virtio_pci_isr_cap VIRTIO_PCI_ISR_CAP;
+typedef VIRTIO_PCI_ISR_CAP* PVIRTIO_PCI_ISR_CAP;
+typedef struct virtio_pci_device_cap VIRTIO_PCI_DEVICE_CAP;
+typedef VIRTIO_PCI_DEVICE_CAP* PVIRTIO_PCI_DEVICE_CAP;
+typedef struct virtio_pci_common_cfg_cap VIRTIO_PCI_COMMON_CFG_CAP;
+typedef VIRTIO_PCI_COMMON_CFG_CAP* PVIRTIO_PCI_COMMON_CFG_CAP;
+
+
+#define PCI_CAP_REDHAT_TYPE_OFFSET  3
+//#define REDHAT_CAP_RESOURCE_RESERVE 1 // <-- This clashes with VIRTIO_PCI_CAP_COMMON_CFG=1 per virtio_pci.h
+#define REDHAT_CAP_RESOURCE_RESERVE 6
+#define REDHAT_CAP_RESOURCE_RESERVE_SIZE 32
+
+#ifndef PCI_RHEL_QEMU_CAPABILITY
+typedef struct {
+  PCI_CAPABILITIES_HEADER Header;
+  struct {
+    u8  len;
+    u8  type;
+    u32 bus_res;
+    u64 io;
+    u32 mem;
+    u32 prefetchable_32;
+    u64 prefetchable_64;
+  } Reservation;
+} PCI_RHEL_QEMU_CAPABILITY, *PPCI_RHEL_QEMU_CAPABILITY;
 #endif
 
 #define SPC3_SCSI_SENSEQ_PARAMETERS_CHANGED                 0x0
