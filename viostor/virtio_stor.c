@@ -130,6 +130,243 @@ VOID WppCleanupRoutine(PVOID arg1)
 }
 #endif
 
+USHORT CopyBufferToAnsiString(void *_pDest, const void *_pSrc, const char delimiter, size_t _maxlength)
+{
+    PCHAR dst = (PCHAR)_pDest;
+    PCHAR src = (PCHAR)_pSrc;
+    USHORT _length = _maxlength;
+
+    while (_length && (*src != delimiter))
+    {
+        *dst++ = *src++;
+        --_length;
+    };
+    *dst = '\0';
+    return _length;
+}
+
+BOOLEAN VioStorReadRegistryParameter(IN PVOID DeviceExtension, IN PUCHAR ValueName, IN LONG offset)
+{
+    BOOLEAN bReadResult = FALSE;
+    BOOLEAN bUseAltPerHbaRegRead = FALSE;
+    ULONG pBufferLength = sizeof(ULONG);
+    UCHAR *pBuffer = NULL;
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    ULONG spgspn_rc, i, j;
+    STOR_ADDRESS HwAddress = {0};
+    PSTOR_ADDRESS pHwAddress = &HwAddress;
+    CHAR valname_as_str[64] = {0};
+    CHAR hba_id_as_str[4] = {0};
+    // USHORT              shAdapterId = (USHORT)adaptExt->hba_id;
+    USHORT shAdapterId = 1;
+    ULONG value_as_ulong;
+
+    /* Get a clean buffer to store the registry value... */
+    pBuffer = StorPortAllocateRegistryBuffer(DeviceExtension, &pBufferLength);
+    if (pBuffer == NULL)
+    {
+        RhelDbgPrint(TRACE_LEVEL_WARNING, " StorPortAllocateRegistryBuffer failed to allocate buffer\n");
+        return FALSE;
+    }
+    memset(pBuffer, 0, sizeof(ULONG));
+
+    /* Check if we can get a System PortNumber to access the \Parameters\Device(d) subkey to get a per HBA value.
+     * FIXME NOTE
+     *
+     * Regarding StorPortGetSystemPortNumber():
+     *
+     * StorPort always reports STOR_STATUS_INVALID_DEVICE_STATE and does not update pHwAddress->Port.
+     * Calls to StorPortRegistryRead() and StorPortRegistryWrite() only read or write to \Parameters\Device-1,
+     * which appears to be an uninitialized value. Therefore, the alternate per HBA read technique will always be used.
+     *
+     * Various initialisation syntaxes were attempted, including partial and fullY initialized STOR_ADDRESS and
+     * STOR_ADDR_BTL8 structs and pointers. Attempts to initialize most of the deprecated HW_INITIALIZATION_DATA
+     * and PORT_CONFIGURATION_INFORMATION members were also made, but of no effect with regard to this function.
+     * Using DeviceExtension or the adaptExt pointer as the first parameter to the function had no effect.
+     * Attempts to set the InitiatorBusId were successful, but of no effect with regard to this function.
+     * Also attempted BusType = BusTypeScsi (rather than BusTypeSas per inf default) - in both the inf and using
+     * StorPortSetAdapterBusType() too. Also tried many other BusTypes via StorPortSetAdapterBusType() mechanics.
+     * Maybe something in WMI or VPD processing...? Do we need PortAttributes.PortState = HBA_PORTSTATE_ONLINE and
+     * PortAttributes.PortType = HBA_PORTTYPE_SASDEVICE to be set...? Should we be initializing adaptExt->wwn,
+     * adaptExt->port_wwn or adaptExt->port_idx...? The wMI routines are not using the InstanceIndex and InstanceCount
+     * parameters to cycle through HBAs. Maybe they should...
+     *
+     * Difficult to determine what is wrong here...
+     * ¯\_(ツ)_/¯
+     *
+     * FIXME NOTE END
+     */
+    pHwAddress->Type = STOR_ADDRESS_TYPE_BTL8;
+    pHwAddress->AddressLength = STOR_ADDR_BTL8_ADDRESS_LENGTH;
+    RhelDbgPrint(TRACE_REGISTRY,
+                 " Checking whether the HBA system port number and HBA specific registry are available for reading... "
+                 "\n");
+    spgspn_rc = StorPortGetSystemPortNumber(DeviceExtension, pHwAddress);
+    if (spgspn_rc = STOR_STATUS_INVALID_DEVICE_STATE)
+    {
+        RhelDbgPrint(TRACE_REGISTRY,
+                     " WARNING : !!!...HBA Port not ready yet...!!! Returns : 0x%x (STOR_STATUS_INVALID_DEVICE_STATE) "
+                     "\n",
+                     spgspn_rc);
+        /*
+         * When we are unable to get a valid system PortNumber, we need to
+         * use an alternate per HBA registry read technique. The technique
+         * implemented here uses per HBA registry value names based on the
+         * hba_id, which is the Storport provided slot_number minus one,
+         * padded to hundreds, e.g. \Parameters\Device\Valuename_123.
+         *
+         * This permits up to 999 HBAs. That ought to be enough... c( O.O )ɔ
+         */
+        bUseAltPerHbaRegRead = TRUE;
+        RhelDbgPrint(TRACE_REGISTRY,
+                     " Using alternate per HBA registry read technique [\\Parameters\\Device\\Value_(ddd)]. \n");
+
+        /* Grab the first 60 characters of the target Registry Value.
+         * Value name limit is 16,383 characters, so this is important.
+         * We leave the last 4 characters for the hba_id_as_str values.
+         * NULL terminator wraps things up. Also used in TRACING.
+         */
+        CopyBufferToAnsiString(&valname_as_str, ValueName, '\0', 60);
+        CopyBufferToAnsiString(&hba_id_as_str, &shAdapterId, '\0', 4);
+
+        /* Convert from integer to padded ASCII numbers. */
+        if (shAdapterId / 100)
+        {
+            j = 0;
+            hba_id_as_str[j] = (UCHAR)(shAdapterId / 100) + 48;
+        }
+        else
+        {
+            hba_id_as_str[0] = 48;
+            if (shAdapterId / 10)
+            {
+                j = 1;
+                hba_id_as_str[j] = (UCHAR)(shAdapterId / 10) + 48;
+            }
+            else
+            {
+                hba_id_as_str[1] = 48;
+                j = 2;
+                hba_id_as_str[j] = (UCHAR)shAdapterId + 48;
+            }
+        }
+        if ((j < 1) && (shAdapterId / 10))
+        {
+            j = 1;
+            hba_id_as_str[j] = (UCHAR)(((shAdapterId - ((shAdapterId / 100) * 100)) / 10) + 48);
+        }
+        else if ((j < 2) && (shAdapterId > 9))
+        {
+            j = 2;
+            hba_id_as_str[j] = (UCHAR)((shAdapterId - ((shAdapterId / 10) * 10)) + 48);
+        }
+        else
+        {
+            j = 1;
+            hba_id_as_str[j] = 48;
+        }
+        if ((j < 2) && (shAdapterId > 0))
+        {
+            j = 2;
+            hba_id_as_str[j] = (UCHAR)((shAdapterId - ((shAdapterId / 10) * 10)) + 48);
+        }
+        else if (j < 2)
+        {
+            j = 2;
+            hba_id_as_str[j] = 48;
+        }
+        /* NULL-terminate the string. */
+        hba_id_as_str[3] = '\0';
+        /* Skip the exisitng ValueName. */
+        for (i = 0; valname_as_str[i] != '\0'; ++i)
+        {
+        }
+        /* Append an underscore. */
+        valname_as_str[i] = '\x5F';
+        /* Append the padded HBA ID and NULL terminator. */
+        for (j = 0; j < 4; ++j)
+        {
+            valname_as_str[i + j + 1] = hba_id_as_str[j];
+        }
+
+        PUCHAR ValueNamePerHba = (UCHAR *)&valname_as_str;
+        bReadResult = StorPortRegistryRead(DeviceExtension,
+                                           ValueNamePerHba,
+                                           1,
+                                           MINIPORT_REG_DWORD,
+                                           pBuffer,
+                                           &pBufferLength);
+    }
+    else
+    {
+        RhelDbgPrint(TRACE_REGISTRY, " HBA Port : %u | Returns : 0x%x \n", pHwAddress->Port, spgspn_rc);
+        RhelDbgPrint(TRACE_REGISTRY, " Using StorPort-based per HBA registry read [\\Parameters\\Device(d)]. \n");
+        /* FIXME : THIS DOES NOT WORK. IT WILL NOT READ \Parameters\Device(d) subkeys...
+         * NOTE  : Only MINIPORT_REG_DWORD values are supported.
+         */
+        bReadResult = StorPortRegistryRead(DeviceExtension, ValueName, 0, MINIPORT_REG_DWORD, pBuffer, &pBufferLength);
+        /* Grab the first 64 characters of the target Registry Value.
+         * Value name limit is 16,383 characters, so this is important.
+         * NULL terminator wraps things up. Used in TRACING.
+         */
+        CopyBufferToAnsiString(&valname_as_str, ValueName, '\0', 64);
+    }
+
+    if ((bReadResult == FALSE) || (pBufferLength == 0))
+    {
+        RhelDbgPrint(TRACE_REGISTRY,
+                     " StorPortRegistryRead was unable to find a per HBA value %s. Attempting to find a global "
+                     "value... \n",
+                     (bUseAltPerHbaRegRead) ? "using \\Parameters\\Device\\Value_(ddd) value names"
+                                            : "at the \\Parameters\\Device(d) subkey");
+        bReadResult = FALSE;
+        pBufferLength = sizeof(ULONG);
+        memset(pBuffer, 0, sizeof(ULONG));
+
+        /* Do a "Global" read of the Parameters\Device subkey...
+         * NOTE : Only MINIPORT_REG_DWORD values are supported.
+         */
+        bReadResult = StorPortRegistryRead(DeviceExtension, ValueName, 1, MINIPORT_REG_DWORD, pBuffer, &pBufferLength);
+        /* Grab the first 64 characters of the target Registry Value.
+         * Value name limit is 16,383 characters, so this is important.
+         * NULL terminator wraps things up. Used in TRACING.
+         */
+        CopyBufferToAnsiString(&valname_as_str, ValueName, '\0', 64);
+    }
+    /* Give me the DWORD Registry Value as a ULONG from the pointer.
+     * Used in TRACING.
+     */
+    memcpy(&value_as_ulong, pBuffer, sizeof(ULONG));
+
+    if ((bReadResult == FALSE) || (pBufferLength == 0))
+    {
+        RhelDbgPrint(TRACE_REGISTRY,
+                     " StorPortRegistryRead of %s returned NOT FOUND or EMPTY, pBufferLength = %d, Possible "
+                     "pBufferLength Hint = 0x%x (%lu) \n",
+                     valname_as_str,
+                     pBufferLength,
+                     value_as_ulong,
+                     value_as_ulong);
+        StorPortFreeRegistryBuffer(DeviceExtension, pBuffer);
+        return FALSE;
+    }
+    else
+    {
+        RhelDbgPrint(TRACE_REGISTRY,
+                     " StorPortRegistryRead of %s returned SUCCESS, pBufferLength = %d, Value = 0x%x (%lu) \n",
+                     valname_as_str,
+                     pBufferLength,
+                     value_as_ulong,
+                     value_as_ulong);
+
+        StorPortCopyMemory((PVOID)((UINT_PTR)adaptExt + offset), (PVOID)pBuffer, sizeof(ULONG));
+
+        StorPortFreeRegistryBuffer(DeviceExtension, pBuffer);
+
+        return TRUE;
+    }
+}
+
 ULONG
 DriverEntry(IN PVOID DriverObject, IN PVOID RegistryPath)
 {
@@ -238,7 +475,7 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
 {
     PACCESS_RANGE accessRange;
     PADAPTER_EXTENSION adaptExt;
-    USHORT queueLength;
+    USHORT queue_length;
     ULONG pci_cfg_len;
     ULONG res, i;
 
@@ -246,11 +483,16 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
     ULONG num_cpus;
     ULONG max_cpus;
     ULONG max_queues;
+    ULONG max_sectors;
+    ULONG max_segs_candidate[3] = {0};
     ULONG Size;
     ULONG HeapSize;
 
     PVOID uncachedExtensionVa;
     ULONG extensionSize;
+    ULONG uncachedExtPad1 = 0;
+    ULONG uncachedExtPad2 = 4096;
+    ULONG uncachedExtSize;
 
     UNREFERENCED_PARAMETER(HwContext);
     UNREFERENCED_PARAMETER(BusInformation);
@@ -376,60 +618,204 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
         return res;
     }
 
+    adaptExt->indirect = FALSE;
+    adaptExt->max_segments = SCSI_MINIMUM_PHYSICAL_BREAKS;
+
     RhelGetDiskGeometry(DeviceExtension);
     RhelSetGuestFeatures(DeviceExtension);
+
+    ConfigInfo->CachesData = CHECKBIT(adaptExt->features, VIRTIO_BLK_F_FLUSH) ? TRUE : FALSE;
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION, " VIRTIO_BLK_F_WCACHE = %s\n", (ConfigInfo->CachesData) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+                 " VIRTIO_BLK_F_MQ = %s\n",
+                 (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_MQ)) ? "ON" : "OFF");
+
+    if (!adaptExt->dump_mode)
+    {
+        // we had better check here because we used to do so further down...
+        adaptExt->indirect = CHECKBIT(adaptExt->features, VIRTIO_RING_F_INDIRECT_DESC);
+    }
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION, " VIRTIO_RING_F_INDIRECT_DESC = %s\n", (adaptExt->indirect) ? "ON" : "OFF");
 
     ConfigInfo->NumberOfBuses = 1;
     ConfigInfo->MaximumNumberOfTargets = 1;
     ConfigInfo->MaximumNumberOfLogicalUnits = 1;
-
-    ConfigInfo->CachesData = CHECKBIT(adaptExt->features, VIRTIO_BLK_F_FLUSH) ? TRUE : FALSE;
-    RhelDbgPrint(TRACE_LEVEL_INFORMATION, " VIRTIO_BLK_F_WCACHE = %d\n", ConfigInfo->CachesData);
-    RhelDbgPrint(TRACE_LEVEL_INFORMATION, " VIRTIO_BLK_F_MQ = %d\n", CHECKBIT(adaptExt->features, VIRTIO_BLK_F_MQ));
-
-    virtio_query_queue_allocation(&adaptExt->vdev,
-                                  0,
-                                  &queueLength,
-                                  &adaptExt->pageAllocationSize,
-                                  &adaptExt->poolAllocationSize);
+    ConfigInfo->MaximumTransferLength = SP_UNINITIALIZED_VALUE;  // Unlimited
+    ConfigInfo->NumberOfPhysicalBreaks = SP_UNINITIALIZED_VALUE; // Unlimited
 
     if (!adaptExt->dump_mode)
     {
-        adaptExt->indirect = CHECKBIT(adaptExt->features, VIRTIO_RING_F_INDIRECT_DESC);
-    }
-
-    if (adaptExt->dump_mode)
-    {
-        ConfigInfo->NumberOfPhysicalBreaks = SCSI_MINIMUM_PHYSICAL_BREAKS;
-    }
-    else
-    {
-        ConfigInfo->NumberOfPhysicalBreaks = MAX_PHYS_SEGMENTS;
-    }
-
-    if (adaptExt->indirect)
-    {
-        adaptExt->queue_depth = queueLength;
-    }
-    else
-    {
-        ConfigInfo->NumberOfPhysicalBreaks = max(SCSI_MINIMUM_PHYSICAL_BREAKS, (queueLength / 4));
-        adaptExt->queue_depth = max(((queueLength / ConfigInfo->NumberOfPhysicalBreaks) - 1), 1);
-    }
-    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_SEG_MAX))
-    {
-        ULONG size_max = adaptExt->info.size_max;
-        ULONG seg_max = adaptExt->info.seg_max;
-        if ((size_max > 0) && (seg_max > 0))
+        /* Allow user to override max_segments via reg key
+         * [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\viostor\Parameters\Device]
+         * "MaxPhysicalSegments"={dword value here}
+         *
+         * ATTENTION : This should be the maximum number of memory pages (typ. 4KiB each) in a transfer
+         *             Equivalent to any of the following:
+         *             NumberOfPhysicalBreaks - 1 (NOPB includes known off-by-one error)
+         *             VIRTIO_MAX_SG - 1
+         *             MaximumSGList - 1 (SCSI Port legacy value)
+         *
+         * ATTENTION : This should be the same as the max_segments value of the backing device.
+         *
+         *  WARNING  : This is adapter-wide. Using disks with different max_segments values will result in sub-optimal
+         * performance.
+         */
+        if (VioStorReadRegistryParameter(DeviceExtension,
+                                         REGISTRY_MAX_PH_SEGMENTS,
+                                         FIELD_OFFSET(ADAPTER_EXTENSION, max_segments)))
         {
-            seg_max = (ULONG)((ULONGLONG)seg_max * size_max) / (ROUND_TO_PAGES(size_max));
-            ConfigInfo->NumberOfPhysicalBreaks = seg_max - 1;
+            /* Grab the maximum SEGMENTS value from the registry */
+            RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                         " max_segments candidate was specified in the registry : %lu \n",
+                         adaptExt->max_segments);
         }
-    }
+        else if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_SEG_MAX))
+        {
+            if ((adaptExt->info.size_max > 0) && (adaptExt->info.seg_max > 0))
+            {
+                /* Grab the maximum SEGMENTS value via Guest Features */
+                adaptExt->max_segments = (ULONG)((ULONGLONG)adaptExt->info.seg_max * adaptExt->info.size_max) /
+                                         (ROUND_TO_PAGES(adaptExt->info.size_max));
+                RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                             " max_segments candidate was derived from valid Guest Features : %lu \n",
+                             adaptExt->max_segments);
+            }
+        }
+        else
+        {
+            /* Grab the VirtIO reported maximum SEGMENTS value from the HBA and put it somewhere mutable */
+            adaptExt->max_segments = adaptExt->info.seg_max;
+            RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                         " max_segments candidate was NOT specified in the registry or derived via valid Guest "
+                         "Features. We will attempt to derive the value by other means...\n");
+        }
 
-    ConfigInfo->MaximumTransferLength = ConfigInfo->NumberOfPhysicalBreaks * PAGE_SIZE;
-    ConfigInfo->NumberOfPhysicalBreaks++;
+        /* Use our maximum SEGMENTS value OR use a derived value... */
+        if (adaptExt->indirect)
+        {
+            max_segs_candidate[1] = adaptExt->max_segments;
+            RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                         " max_segments candidate derived from MAX SEGMENTS (reported by QEMU/KVM) as "
+                         "VIRTIO_RING_F_INDIRECT_DESC is ON: %lu \n",
+                         max_segs_candidate[1]);
+        }
+        else
+        {
+            Size = 0;
+            virtio_query_queue_allocation(&adaptExt->vdev, VIRTIO_BLK_REQUEST_QUEUE_0, &queue_length, &Size, &HeapSize);
+            max_segs_candidate[1] = max(SCSI_MINIMUM_PHYSICAL_BREAKS, (queue_length / 4));
+            RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                         " max_segments candidate derived from PHYS_SEGMENTS as VIRTIO_RING_F_INDIRECT_DESC is OFF: "
+                         "%lu \n",
+                         max_segs_candidate[1]);
+        }
+
+        /* Grab the VirtIO reported maximum SECTORS value from the HBA to start with */
+        if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_GEOMETRY))
+        {
+            max_sectors = adaptExt->info.geometry.cylinders * adaptExt->info.geometry.sectors /
+                          adaptExt->info.geometry.heads;
+            if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_BLK_SIZE))
+            {
+                max_segs_candidate[2] = (max_sectors * adaptExt->info.blk_size) / PAGE_SIZE;
+            }
+            else
+            {
+                max_segs_candidate[2] = (max_sectors * SECTOR_SIZE) / PAGE_SIZE;
+            }
+        }
+        else
+        {
+            max_sectors = 0;
+            max_segs_candidate[2] = 0;
+        }
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " max_segments candidate derived from %lu total sectors : %lu \n",
+                     max_sectors,
+                     max_segs_candidate[2]);
+
+        /* Choose the best candidate... */
+        if (max_segs_candidate[1] == max_segs_candidate[2])
+        {
+            /* Start with a comparison of equality */
+            max_segs_candidate[0] = max_segs_candidate[1];
+            RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                         " max_segs_candidate[0] : init - the candidates were the same value : %lu \n",
+                         max_segs_candidate[0]);
+        }
+        else if ((max_segs_candidate[2] > 0) && (max_segs_candidate[2] < MAX_PHYS_SEGMENTS))
+        {
+            /* Use the value derived from the QEMU/KVM hint if it is below the MAX_PHYS_SEGMENTS */
+            max_segs_candidate[0] = max_segs_candidate[2];
+            RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                         " max_segs_candidate[0] : init - the total numner of sectors (%lu) was used to select the "
+                         "candidate : %lu \n",
+                         max_sectors,
+                         max_segs_candidate[0]);
+        }
+        else
+        {
+            /* Take the smallest candidate */
+            max_segs_candidate[0] = min((max_segs_candidate[1]), (max_segs_candidate[2]));
+            RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                         " max_segs_candidate[0] : init - the smallest candidate was selected : %lu \n",
+                         max_segs_candidate[0]);
+        }
+
+        /* Check the value is within SG list bounds */
+        max_segs_candidate[0] = min(max(SCSI_MINIMUM_PHYSICAL_BREAKS, max_segs_candidate[0]), (VIRTIO_MAX_SG - 1));
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " max_segs_candidate[0] : within SG list bounds (%lu) : %lu\n",
+                     (VIRTIO_MAX_SG - 1),
+                     max_segs_candidate[0]);
+
+        /* Check the value is within physical bounds */
+        max_segs_candidate[0] = min(max(SCSI_MINIMUM_PHYSICAL_BREAKS, max_segs_candidate[0]), MAX_PHYS_SEGMENTS);
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " max_segs_candidate[0] : within physical bounds (%lu) : %lu\n",
+                     MAX_PHYS_SEGMENTS,
+                     max_segs_candidate[0]);
+
+        /* Update max_segments for all cases */
+        adaptExt->max_segments = max_segs_candidate[0];
+    }
+    /* Here we enforce legacy off-by-one NumberOfPhysicalBreaks (NOPB) behaviour for StorPort.
+     * This behaviour was retained in StorPort to maintain backwards compatibility.
+     * This is analogous to the legacy MaximumSGList parameter in the SCSI Port driver.
+     * Where:
+     * MaximumSGList = ((MAX_BLOCK_SIZE)/PAGE_SIZE) + 1
+     * The default x86/x64 values being:
+     * MaximumSGList = (64KiB/4KiB) + 1 = 16 + 1 = 17 (0x11)
+     * The MAX_BLOCK_SIZE limit is no longer 64KiB, but 2048KiB (2MiB):
+     * NOPB or MaximumSGList = (2048KiB/4KiB) + 1 = 512 + 1 = 513 (0x201)
+     *
+     * ATTENTION: The MS NOPB documentation for both the SCSI Port and StorPort drivers is incorrect.
+     *
+     * As max_segments = MAX_BLOCK_SIZE/PAGE_SIZE we use:
+     */
+    ConfigInfo->NumberOfPhysicalBreaks = adaptExt->max_segments + 1;
+
+    /* Here we use the efficient single step calculation for MaximumTransferLength
+     *
+     * The alternative would be:
+     * ConfigInfo->MaximumTransferLength = adaptExt->max_segments;
+     * ConfigInfo->MaximumTransferLength <<= PAGE_SHIFT;
+     * ...where #define PAGE_SHIFT 12L
+     *
+     */
+    ConfigInfo->MaximumTransferLength = adaptExt->max_segments * PAGE_SIZE;
     adaptExt->max_tx_length = ConfigInfo->MaximumTransferLength;
+
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+                 " adaptExt->max_segments : 0x%x (%lu) | ConfigInfo->NumberOfPhysicalBreaks : 0x%x (%lu) | "
+                 "ConfigInfo->MaximumTransferLength : 0x%x (%lu) Bytes (%lu KiB) \n",
+                 adaptExt->max_segments,
+                 adaptExt->max_segments,
+                 ConfigInfo->NumberOfPhysicalBreaks,
+                 ConfigInfo->NumberOfPhysicalBreaks,
+                 ConfigInfo->MaximumTransferLength,
+                 ConfigInfo->MaximumTransferLength,
+                 (ConfigInfo->MaximumTransferLength / 1024));
 
     num_cpus = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
     max_cpus = KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS);
@@ -437,14 +823,10 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
     num_cpus = max(1, num_cpus);
     max_cpus = max(1, max_cpus);
 
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Detected Number Of CPUs : %lu\n", num_cpus);
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Maximum Number Of CPUs : %lu\n", max_cpus);
+
     adaptExt->num_queues = 1;
-    if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_MQ))
-    {
-        virtio_get_config(&adaptExt->vdev,
-                          FIELD_OFFSET(blk_config, num_queues),
-                          &adaptExt->num_queues,
-                          sizeof(adaptExt->num_queues));
-    }
 
     if (adaptExt->dump_mode || !adaptExt->msix_enabled)
     {
@@ -452,10 +834,20 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
     }
     else
     {
+        if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_MQ))
+        {
+            virtio_get_config(&adaptExt->vdev,
+                              FIELD_OFFSET(blk_config, num_queues),
+                              &adaptExt->num_queues,
+                              sizeof(adaptExt->num_queues));
+        }
         adaptExt->num_queues = min(adaptExt->num_queues, (USHORT)num_cpus);
     }
 
-    RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Queues %d CPUs %d\n", adaptExt->num_queues, num_cpus);
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+                 " VirtIO Request Queues : %lu | CPUs : %lu \n",
+                 adaptExt->num_queues,
+                 num_cpus);
 
     max_queues = min(max_cpus, adaptExt->num_queues);
     adaptExt->pageAllocationSize = 0;
@@ -464,9 +856,16 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
     adaptExt->poolOffset = 0;
     Size = 0;
 
-    for (index = 0; index < max_queues; ++index)
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                 " START: pageAllocationSize : %lu KiB | Size : %lu KiB | poolAllocationSize : %lu Bytes | HeapSize is "
+                 "not yet defined. \n",
+                 (adaptExt->pageAllocationSize / 1024),
+                 (Size / 1024),
+                 adaptExt->poolAllocationSize);
+
+    for (index = VIRTIO_BLK_REQUEST_QUEUE_0; index < max_queues; ++index)
     {
-        virtio_query_queue_allocation(&adaptExt->vdev, index, &queueLength, &Size, &HeapSize);
+        virtio_query_queue_allocation(&adaptExt->vdev, index, &queue_length, &Size, &HeapSize);
         if (Size == 0)
         {
             LogError(DeviceExtension, SP_INTERNAL_ADAPTER_ERROR, __LINE__);
@@ -476,58 +875,159 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
         }
         adaptExt->pageAllocationSize += ROUND_TO_PAGES(Size);
         adaptExt->poolAllocationSize += ROUND_TO_CACHE_LINES(HeapSize);
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " INCR : pageAllocationSize : %lu KiB | Size : %lu KiB | poolAllocationSize : %lu Bytes | "
+                     "HeapSize : %lu Bytes \n",
+                     (adaptExt->pageAllocationSize / 1024),
+                     (Size / 1024),
+                     adaptExt->poolAllocationSize,
+                     HeapSize);
     }
     if (!adaptExt->dump_mode)
     {
         adaptExt->poolAllocationSize += ROUND_TO_CACHE_LINES(sizeof(SRB_EXTENSION));
         adaptExt->poolAllocationSize += ROUND_TO_CACHE_LINES(sizeof(STOR_DPC) * max_queues);
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " DUMP : pageAllocationSize : %lu KiB | Size : %lu KiB | poolAllocationSize : %lu Bytes | "
+                     "HeapSize : %lu Bytes \n",
+                     (adaptExt->pageAllocationSize / 1024),
+                     (Size / 1024),
+                     adaptExt->poolAllocationSize,
+                     HeapSize);
     }
     if (max_queues > MAX_QUEUES_PER_DEVICE_DEFAULT)
     {
         adaptExt->poolAllocationSize += ROUND_TO_CACHE_LINES((ULONGLONG)(max_queues)*virtio_get_queue_descriptor_size());
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " LIMIT: pageAllocationSize : %lu KiB | Size : %lu KiB | poolAllocationSize : %lu Bytes | "
+                     "HeapSize : %lu Bytes \n",
+                     (adaptExt->pageAllocationSize / 1024),
+                     (Size / 1024),
+                     adaptExt->poolAllocationSize,
+                     HeapSize);
     }
 
     RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                 " breaks_number = %x  queue_depth = %x\n",
-                 ConfigInfo->NumberOfPhysicalBreaks,
+                 " FINAL: pageAllocationSize : %lu KiB | Size : %lu KiB | poolAllocationSize : %lu Bytes | HeapSize : "
+                 "%lu Bytes \n",
+                 (adaptExt->pageAllocationSize / 1024),
+                 (Size / 1024),
+                 adaptExt->poolAllocationSize,
+                 HeapSize);
+
+    if (adaptExt->indirect)
+    {
+        adaptExt->queue_depth = queue_length;
+    }
+    else
+    {
+        adaptExt->queue_depth = max((queue_length / adaptExt->max_segments), 1);
+    }
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+                 " Calculate Queue Depth : VIRTIO_RING_F_INDIRECT_DESC is %s | VIRTIO determined Queue Length "
+                 "[queue_length] : %lu | Calulated Queue Depth [queue_depth] : %lu \n",
+                 (adaptExt->indirect) ? "ON" : "OFF",
+                 queue_length,
                  adaptExt->queue_depth);
 
-    extensionSize = PAGE_SIZE + adaptExt->pageAllocationSize + adaptExt->poolAllocationSize;
-    uncachedExtensionVa = StorPortGetUncachedExtension(DeviceExtension, ConfigInfo, extensionSize);
+    ConfigInfo->MaxIOsPerLun = adaptExt->queue_depth * adaptExt->num_queues;
+    ConfigInfo->InitialLunQueueDepth = ConfigInfo->MaxIOsPerLun;
+    ConfigInfo->MaxNumberOfIO = ConfigInfo->MaxIOsPerLun;
+
     RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                 " StorPortGetUncachedExtension uncachedExtensionVa = %p allocation size = %d\n",
-                 uncachedExtensionVa,
-                 extensionSize);
+                 " StorPort Submission: NumberOfPhysicalBreaks = 0x%x (%lu), MaximumTransferLength = 0x%x (%lu KiB), "
+                 "MaxNumberOfIO = %lu, MaxIOsPerLun = %lu, InitialLunQueueDepth = %lu \n",
+                 ConfigInfo->NumberOfPhysicalBreaks,
+                 ConfigInfo->NumberOfPhysicalBreaks,
+                 ConfigInfo->MaximumTransferLength,
+                 (ConfigInfo->MaximumTransferLength / 1024),
+                 ConfigInfo->MaxNumberOfIO,
+                 ConfigInfo->MaxIOsPerLun,
+                 ConfigInfo->InitialLunQueueDepth);
+
+    /* If needed, calculate the padding for the pool allocation to keep the uncached extension page aligned */
+    if (adaptExt->poolAllocationSize > 0)
+    {
+        uncachedExtPad2 = (ROUND_TO_PAGES(adaptExt->poolAllocationSize)) - adaptExt->poolAllocationSize;
+    }
+    uncachedExtSize = uncachedExtPad1 + adaptExt->pageAllocationSize + adaptExt->poolAllocationSize + uncachedExtPad2;
+    uncachedExtensionVa = StorPortGetUncachedExtension(DeviceExtension, ConfigInfo, uncachedExtSize);
+
     if (!uncachedExtensionVa)
     {
         LogError(DeviceExtension, SP_INTERNAL_ADAPTER_ERROR, __LINE__);
-
-        RhelDbgPrint(TRACE_LEVEL_FATAL, " Can't get uncached extension allocation size = %d\n", extensionSize);
+        RhelDbgPrint(TRACE_LEVEL_FATAL,
+                     " Unable to obtain uncached extension allocation of size = %lu Bytes (%lu KiB)\n",
+                     uncachedExtSize,
+                     (uncachedExtSize / 1024));
         return SP_RETURN_ERROR;
     }
+    else
+    {
+        RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+                     " MEMORY ALLOCATION : %p, size = %lu (0x%x) Bytes | StorPortGetUncachedExtension() "
+                     "[uncachedExtensionVa] (size = %lu KiB) \n",
+                     uncachedExtensionVa,
+                     uncachedExtSize,
+                     uncachedExtSize,
+                     (uncachedExtSize / 1024));
+    }
 
-    adaptExt->pageAllocationVa = (PVOID)(((ULONG_PTR)(uncachedExtensionVa) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+    /* At this point we have all the memory we're going to need. We lay it out as follows.
+     * Note that we cause StorPortGetUncachedExtension to return a page-aligned memory allocation so
+     * the padding1 region will typically be empty and padding2 will be sized to ensure page alignment.
+     *
+     * uncachedExtensionVa    pageAllocationVa         poolAllocationVa
+     * +----------------------+------------------------+--------------------------+----------------------+
+     * | \ \ \ \ \ \ \ \ \ \  |<= pageAllocationSize =>|<=  poolAllocationSize  =>| \ \ \ \ \ \ \ \ \ \  |
+     * |  \ \  padding1 \ \ \ |                        |                          |  \ \  padding2 \ \ \ |
+     * | \ \ \ \ \ \ \ \ \ \  |    page-aligned area   | pool area for cache-line | \ \ \ \ \ \ \ \ \ \  |
+     * |  \ \ \ \ \ \ \ \ \ \ |                        | aligned allocations      |  \ \ \ \ \ \ \ \ \ \ |
+     * +----------------------+------------------------+--------------------------+----------------------+
+     * |<====================================  uncachedExtSize  ========================================>|
+     */
+
+    /* Get the Virtual Address of the page aligned area */
+    adaptExt->pageAllocationVa = (PVOID)(((ULONG_PTR)(uncachedExtensionVa) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1));
+
+    /* If needed, get the Virtual Address of the pool (cache-line aligned) area */
     if (adaptExt->poolAllocationSize > 0)
     {
         adaptExt->poolAllocationVa = (PVOID)((ULONG_PTR)adaptExt->pageAllocationVa + adaptExt->pageAllocationSize);
     }
     RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                 " Page-aligned area at %p, size = %d\n",
+                 " MEMORY ALLOCATION : %p, size = %lu (0x%x) Bytes | Page-aligned area [pageAllocationVa] (size = %lu "
+                 "KiB) \n",
                  adaptExt->pageAllocationVa,
-                 adaptExt->pageAllocationSize);
+                 adaptExt->pageAllocationSize,
+                 adaptExt->pageAllocationSize,
+                 (adaptExt->pageAllocationSize / 1024));
     RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                 " Pool area at %p, size = %d\n",
+                 " MEMORY ALLOCATION : %p, size = %lu (0x%x) Bytes | Pool (cache-line aligned) area [poolAllocationVa] "
+                 "\n",
                  adaptExt->poolAllocationVa,
+                 adaptExt->poolAllocationSize,
                  adaptExt->poolAllocationSize);
-    RhelDbgPrint(TRACE_LEVEL_INFORMATION, " pmsg_affinity = %p\n", adaptExt->pmsg_affinity);
-    if (!adaptExt->dump_mode && (adaptExt->num_queues > 1) && (adaptExt->pmsg_affinity == NULL))
+
+    /* Allocate a memory pool for the CPU affinity masks */
+    if ((!adaptExt->dump_mode) && (adaptExt->num_queues > 1) && (adaptExt->pmsg_affinity == NULL))
     {
-        adaptExt->num_affinity = adaptExt->num_queues + 1;
+
+        adaptExt->num_affinity = adaptExt->num_queues + VIRTIO_BLK_MSIX_VQ_OFFSET;
+
         ULONG Status = StorPortAllocatePool(DeviceExtension,
                                             sizeof(GROUP_AFFINITY) * (ULONGLONG)adaptExt->num_affinity,
                                             VIOBLK_POOL_TAG,
                                             (PVOID *)&adaptExt->pmsg_affinity);
-        RhelDbgPrint(TRACE_LEVEL_FATAL, " pmsg_affinity = %p Status = %lu\n", adaptExt->pmsg_affinity, Status);
+
+        RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+                     " MEMORY ALLOCATION : %p, size = %lu (0x%x) Bytes | CPU Affinity [pmsg_affinity] | num_affinity = "
+                     "%lu, StorPortAllocatePool() Status = 0x%x \n",
+                     adaptExt->pmsg_affinity,
+                     (sizeof(GROUP_AFFINITY) * (ULONGLONG)adaptExt->num_affinity),
+                     (sizeof(GROUP_AFFINITY) * (ULONGLONG)adaptExt->num_affinity),
+                     adaptExt->num_affinity,
+                     Status);
     }
 
     adaptExt->fw_ver = '0';
@@ -652,12 +1152,70 @@ VOID RhelSetGuestFeatures(IN PVOID DeviceExtension)
         guestFeatures |= (1ULL << VIRTIO_F_ORDER_PLATFORM);
     }
 
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                 " Host Features : %llu | Guest Features : %llu\n",
+                 adaptExt->features,
+                 guestFeatures);
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_F_VERSION_1 flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_F_VERSION_1)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_F_RING_PACKED flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_F_RING_PACKED)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_F_ANY_LAYOUT flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_F_ANY_LAYOUT)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_F_ACCESS_PLATFORM flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_F_ACCESS_PLATFORM)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_RING_F_EVENT_IDX flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_RING_F_EVENT_IDX)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_RING_F_INDIRECT_DESC flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_RING_F_INDIRECT_DESC)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_BLK_F_FLUSH flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_BLK_F_FLUSH)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_BLK_F_BARRIER flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_BLK_F_BARRIER)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_BLK_F_RO flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_BLK_F_RO)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_BLK_F_SIZE_MAX flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_BLK_F_SIZE_MAX)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_BLK_F_SEG_MAX flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_BLK_F_SEG_MAX)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_BLK_F_BLK_SIZE flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_BLK_F_BLK_SIZE)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_BLK_F_GEOMETRY flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_BLK_F_GEOMETRY)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_BLK_F_MQ flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_BLK_F_MQ)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_BLK_F_DISCARD flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_BLK_F_DISCARD)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_BLK_F_WRITE_ZEROES flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_BLK_F_WRITE_ZEROES)) ? "ON" : "OFF");
+    RhelDbgPrint(TRACE_GUEST_FEATURES,
+                 " VIRTIO_F_ORDER_PLATFORM flag is : %s \n",
+                 (guestFeatures & (1ULL << VIRTIO_F_ORDER_PLATFORM)) ? "ON" : "OFF");
+
     if (!NT_SUCCESS(virtio_set_features(&adaptExt->vdev, guestFeatures)))
     {
-        RhelDbgPrint(TRACE_LEVEL_FATAL, " virtio_set_features failed\n");
-        return;
+        RhelDbgPrint(TRACE_LEVEL_WARNING, " virtio_set_features() FAILED...!!!\n");
     }
-    RhelDbgPrint(TRACE_LEVEL_VERBOSE, " Host Features %llu gust features %llu\n", adaptExt->features, guestFeatures);
+    else
+    {
+        RhelDbgPrint(TRACE_GUEST_FEATURES, " virtio_set_features() executed successfully.\n");
+    }
 }
 
 BOOLEAN
@@ -670,6 +1228,7 @@ VirtIoHwInitialize(IN PVOID DeviceExtension)
     ULONG status = STOR_STATUS_SUCCESS;
     MESSAGE_INTERRUPT_INFORMATION msi_info = {0};
     PREQUEST_LIST element = NULL;
+    ULONG index = 0;
 
     adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
 
@@ -678,46 +1237,230 @@ VirtIoHwInitialize(IN PVOID DeviceExtension)
     adaptExt->poolOffset = 0;
     adaptExt->stopped = FALSE;
 
+    if ((!adaptExt->dump_mode) && (adaptExt->num_queues > 1) && (adaptExt->perfFlags == 0))
+    {
+        perfData.Version = STOR_PERF_VERSION;
+        perfData.Size = sizeof(PERF_CONFIGURATION_DATA);
+
+        status = StorPortInitializePerfOpts(DeviceExtension, TRUE, &perfData);
+
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " PERF: Perf Version = 0x%x, Flags = 0x%x, ConcurrentChannels = %d, FirstRedirectionMessageNumber "
+                     "= %d, LastRedirectionMessageNumber = %d, DeviceNode = %d\n",
+                     perfData.Version,
+                     perfData.Flags,
+                     perfData.ConcurrentChannels,
+                     perfData.FirstRedirectionMessageNumber,
+                     perfData.LastRedirectionMessageNumber,
+                     perfData.DeviceNode);
+    }
+    else
+    {
+        RhelDbgPrint(TRACE_LEVEL_WARNING, " PERF: StorPortInitializePerfOpts GET failed with status = 0x%x\n", status);
+    }
+    if ((status == STOR_STATUS_SUCCESS) && (CHECKFLAG(perfData.Flags, STOR_PERF_DPC_REDIRECTION)))
+    {
+        adaptExt->perfFlags = STOR_PERF_DPC_REDIRECTION;
+        if (CHECKFLAG(perfData.Flags, STOR_PERF_CONCURRENT_CHANNELS))
+        {
+            adaptExt->perfFlags |= STOR_PERF_CONCURRENT_CHANNELS;
+            perfData.ConcurrentChannels = adaptExt->num_queues;
+        }
+        if (CHECKFLAG(perfData.Flags, STOR_PERF_INTERRUPT_MESSAGE_RANGES))
+        {
+            adaptExt->perfFlags |= STOR_PERF_INTERRUPT_MESSAGE_RANGES;
+            perfData.FirstRedirectionMessageNumber = VIRTIO_BLK_MSIX_VQ_OFFSET;
+            perfData.LastRedirectionMessageNumber = perfData.FirstRedirectionMessageNumber +
+                                                    perfData.ConcurrentChannels - 1;
+        }
+        ASSERT(perfData.lastRedirectionMessageNumber < adaptExt->num_affinity);
+        if ((adaptExt->pmsg_affinity != NULL) && CHECKFLAG(perfData.Flags, STOR_PERF_ADV_CONFIG_LOCALITY))
+        {
+            RtlZeroMemory((PCHAR)adaptExt->pmsg_affinity, sizeof(GROUP_AFFINITY) * ((ULONGLONG)adaptExt->num_affinity));
+            adaptExt->perfFlags |= STOR_PERF_ADV_CONFIG_LOCALITY;
+            perfData.MessageTargets = adaptExt->pmsg_affinity;
+        }
+        if (CHECKFLAG(perfData.Flags, STOR_PERF_DPC_REDIRECTION_CURRENT_CPU))
+        {
+#if defined(NTDDI_WIN10_CO) && (NTDDI_VERSION >= NTDDI_WIN10_CO)
+            /* Here we only see performance improvement in later Windows versions
+             * We take a punt that NTDDI_WIN10_CO is high enough.
+             * Only tested against NTDDI_WIN11_GE...
+             */
+            adaptExt->perfFlags |= STOR_PERF_DPC_REDIRECTION_CURRENT_CPU;
+#endif
+        }
+        if (CHECKFLAG(perfData.Flags, STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO))
+        {
+            adaptExt->perfFlags |= STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO;
+        }
+        if (CHECKFLAG(perfData.Flags, STOR_PERF_NO_SGL))
+        {
+            /* FIXME : We still use
+             *          StorPortGetScatterGatherList(), and
+             *          ConfigInfo->ScatterGather = TRUE,
+             *         so not sure why we are using STOR_PERF_NO_SGL here.
+             *         Does not enable anyway...
+             */
+            adaptExt->perfFlags |= STOR_PERF_NO_SGL;
+        }
+        perfData.Flags = adaptExt->perfFlags;
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " PERF: Perf Version = 0x%x, Flags = 0x%x, ConcurrentChannels = %d, "
+                     "FirstRedirectionMessageNumber = %d, LastRedirectionMessageNumber = %d, DeviceNode = %d\n",
+                     perfData.Version,
+                     perfData.Flags,
+                     perfData.ConcurrentChannels,
+                     perfData.FirstRedirectionMessageNumber,
+                     perfData.LastRedirectionMessageNumber,
+                     perfData.DeviceNode);
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " PERF: STOR_PERF_DPC_REDIRECTION flag is : %s \n",
+                     (CHECKFLAG(perfData.Flags, STOR_PERF_DPC_REDIRECTION)) ? "ON" : "OFF");
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " PERF: STOR_PERF_CONCURRENT_CHANNELS flag is: %s \n",
+                     (CHECKFLAG(perfData.Flags, STOR_PERF_CONCURRENT_CHANNELS)) ? "ON" : "OFF");
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " PERF: STOR_PERF_INTERRUPT_MESSAGE_RANGES flag is : %s \n",
+                     (CHECKFLAG(perfData.Flags, STOR_PERF_INTERRUPT_MESSAGE_RANGES)) ? "ON" : "OFF");
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " PERF: STOR_PERF_ADV_CONFIG_LOCALITY flag is: %s \n",
+                     (CHECKFLAG(perfData.Flags, STOR_PERF_ADV_CONFIG_LOCALITY)) ? "ON" : "OFF");
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " PERF: STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO flag is: %s \n",
+                     (CHECKFLAG(perfData.Flags, STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO)) ? "ON" : "OFF");
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " PERF: STOR_PERF_DPC_REDIRECTION_CURRENT_CPU flag is : %s \n",
+                     (CHECKFLAG(perfData.Flags, STOR_PERF_DPC_REDIRECTION_CURRENT_CPU)) ? "ON" : "OFF");
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " PERF: STOR_PERF_NO_SGL flag is : %s \n",
+                     (CHECKFLAG(perfData.Flags, STOR_PERF_NO_SGL)) ? "ON" : "OFF");
+
+        status = StorPortInitializePerfOpts(DeviceExtension, FALSE, &perfData);
+
+        if (status != STOR_STATUS_SUCCESS)
+        {
+            adaptExt->perfFlags = 0;
+            RhelDbgPrint(TRACE_LEVEL_ERROR,
+                         " PERF: StorPortInitializePerfOpts SET failed with status = 0x%x\n",
+                         status);
+        }
+        for (index = 0; index < adaptExt->num_affinity; ++index)
+        {
+            GROUP_AFFINITY vector_affinity = adaptExt->pmsg_affinity[index];
+            RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                         " PERF: MSI-X Vector %lu CPU Affinity : KAFFINITY Mask = %I64d, CPU Group = %lu \n",
+                         index,
+                         vector_affinity.Mask,
+                         vector_affinity.Group);
+        }
+    }
+
     while (StorPortGetMSIInfo(DeviceExtension, adaptExt->msix_vectors, &msi_info) == STOR_STATUS_SUCCESS)
     {
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " MessageId = %x\n", msi_info.MessageId);
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " MessageData = %x\n", msi_info.MessageData);
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " InterruptVector = %x\n", msi_info.InterruptVector);
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " InterruptLevel = %x\n", msi_info.InterruptLevel);
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                     " InterruptMode = %s\n",
-                     msi_info.InterruptMode == LevelSensitive ? "LevelSensitive" : "Latched");
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " MessageAddress = %I64x\n\n", msi_info.MessageAddress.QuadPart);
+        if (adaptExt->num_queues > 1)
+        {
+            RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+                         " MSI-X Vector [MessageId] = %lu, MessageAddress = 0x%I64x, MessageData = %lu, "
+                         "InterruptVector = %lu, InterruptLevel = %lu, InterruptMode = %s, CPU Affinity : "
+                         "Mask = %I64d, Group = %lu \n",
+                         msi_info.MessageId,
+                         msi_info.MessageAddress.QuadPart,
+                         msi_info.MessageData,
+                         msi_info.InterruptVector,
+                         msi_info.InterruptLevel,
+                         msi_info.InterruptMode == LevelSensitive ? "LevelSensitive" : "Latched",
+                         adaptExt->pmsg_affinity[msi_info.MessageId].Mask,
+                         adaptExt->pmsg_affinity[msi_info.MessageId].Group);
+        }
+        else
+        {
+            RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+                         " MSI-X Vector [MessageId] = %lu, MessageAddress = 0x%I64x, MessageData = %lu, "
+                         "InterruptVector = %lu, InterruptLevel = %lu, InterruptMode = %s \n",
+                         msi_info.MessageId,
+                         msi_info.MessageAddress.QuadPart,
+                         msi_info.MessageData,
+                         msi_info.InterruptVector,
+                         msi_info.InterruptLevel,
+                         msi_info.InterruptMode == LevelSensitive ? "LevelSensitive" : "Latched");
+        }
         ++adaptExt->msix_vectors;
     }
 
-    RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Queues %d msix_vectors %d\n", adaptExt->num_queues, adaptExt->msix_vectors);
-    if (adaptExt->num_queues > 1 && ((adaptExt->num_queues + 1U) > adaptExt->msix_vectors))
+    if ((adaptExt->num_queues > 1) && ((adaptExt->num_queues + VIRTIO_BLK_MSIX_VQ_OFFSET) > adaptExt->msix_vectors))
     {
         adaptExt->num_queues = (USHORT)adaptExt->msix_vectors;
     }
 
-    if (adaptExt->msix_vectors >= (adaptExt->num_queues + 1U))
+    if (!adaptExt->dump_mode && adaptExt->msix_vectors > 0)
     {
-        /* initialize queues with a MSI vector per queue */
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION, (" Using a unique MSI vector per queue\n"));
-        adaptExt->msix_one_vector = FALSE;
+        if (adaptExt->msix_vectors >= (adaptExt->num_queues + VIRTIO_BLK_MSIX_VQ_OFFSET))
+        {
+            /* initialize queues with a MSI vector per queue */
+            adaptExt->msix_one_vector = FALSE;
+        }
+        else
+        {
+            /* if we don't have enough vectors, use one for all queues */
+            adaptExt->msix_one_vector = TRUE;
+        }
     }
     else
     {
-        /* if we don't have enough vectors, use one for all queues */
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION, (" Using one MSI vector for all queues\n"));
-        adaptExt->msix_one_vector = TRUE;
+        /* initialize queues with no MSI interrupts */
+        adaptExt->msix_enabled = FALSE;
     }
 
     if (!InitializeVirtualQueues(adaptExt))
     {
         LogError(DeviceExtension, SP_INTERNAL_ADAPTER_ERROR, __LINE__);
-
-        RhelDbgPrint(TRACE_LEVEL_FATAL, (" Cannot find snd virtual queue\n"));
+        RhelDbgPrint(TRACE_LEVEL_FATAL, " !!! - Failed to initialize the Virtual Queues - !!!\n");
         virtio_add_status(&adaptExt->vdev, VIRTIO_CONFIG_S_FAILED);
-        return ret;
+        return FALSE;
     }
+
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+                 " VirtIO Request Queues : %d, MSI-X Enabled : %s, MSI-X Use ONE Vector : %s, MSI-X Vectors "
+                 "[msix_vectors] : %d \n",
+                 adaptExt->num_queues,
+                 (adaptExt->msix_enabled) ? "YES" : "NO",
+                 (adaptExt->msix_one_vector) ? "YES" : "NO",
+                 adaptExt->msix_vectors);
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                 " MSI-X Vector %lu | StorPort exclusive control \n",
+                 (VIRTIO_BLK_MSIX_VQ_OFFSET - 1));
+
+    for (index = 0; index < adaptExt->num_queues; ++index)
+    {
+        element = &adaptExt->processing_srbs[index];
+        InitializeListHead(&element->srb_list);
+        element->srb_cnt = 0;
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                     " MSI-X Vector %lu | VIRTIO Request Queue %lu (index %lu) \n",
+                     (index + VIRTIO_BLK_MSIX_VQ_OFFSET),
+                     (index + VIRTIO_BLK_MSIX_VQ_OFFSET),
+                     index);
+    }
+
+    if (!adaptExt->dump_mode)
+    {
+        /* we don't get another chance to call StorPortEnablePassiveInitialization and initialize
+         * DPCs if the adapter is being restarted, so leave our datastructures alone on restart
+         */
+        if (adaptExt->dpc == NULL)
+        {
+            adaptExt->dpc = (PSTOR_DPC)VioStorPoolAlloc(DeviceExtension, sizeof(STOR_DPC) * adaptExt->num_queues);
+        }
+        if (!adaptExt->dpc_ok && !StorPortEnablePassiveInitialization(DeviceExtension, VirtIoPassiveInitializeRoutine))
+        {
+            RhelDbgPrint(TRACE_LEVEL_FATAL, " StorPortEnablePassiveInitialization FAILED\n");
+            virtio_add_status(&adaptExt->vdev, VIRTIO_CONFIG_S_FAILED);
+            return FALSE;
+        }
+    }
+
+    virtio_device_ready(&adaptExt->vdev);
 
     memset(&adaptExt->inquiry_data, 0, sizeof(INQUIRYDATA));
 
@@ -732,111 +1475,7 @@ VirtIoHwInitialize(IN PVOID DeviceExtension)
     StorPortMoveMemory(&adaptExt->inquiry_data.ProductRevisionLevel, "0001", sizeof("0001"));
     StorPortMoveMemory(&adaptExt->inquiry_data.VendorSpecific, "0001", sizeof("0001"));
 
-    ret = TRUE;
-
-    if (!adaptExt->dump_mode)
-    {
-        if ((adaptExt->num_queues > 1) && (adaptExt->perfFlags == 0))
-        {
-            perfData.Version = STOR_PERF_VERSION;
-            perfData.Size = sizeof(PERF_CONFIGURATION_DATA);
-
-            status = StorPortInitializePerfOpts(DeviceExtension, TRUE, &perfData);
-
-            RhelDbgPrint(TRACE_LEVEL_VERBOSE,
-                         " Perf Version = 0x%x, Flags = 0x%x, ConcurrentChannels = %d, FirstRedirectionMessageNumber = "
-                         "%d,LastRedirectionMessageNumber = %d\n",
-                         perfData.Version,
-                         perfData.Flags,
-                         perfData.ConcurrentChannels,
-                         perfData.FirstRedirectionMessageNumber,
-                         perfData.LastRedirectionMessageNumber);
-            if (status == STOR_STATUS_SUCCESS)
-            {
-                if (CHECKFLAG(perfData.Flags, STOR_PERF_DPC_REDIRECTION))
-                {
-                    adaptExt->perfFlags |= STOR_PERF_DPC_REDIRECTION;
-                }
-                if (CHECKFLAG(perfData.Flags, STOR_PERF_INTERRUPT_MESSAGE_RANGES))
-                {
-                    adaptExt->perfFlags |= STOR_PERF_INTERRUPT_MESSAGE_RANGES;
-                    perfData.FirstRedirectionMessageNumber = 1;
-                    perfData.LastRedirectionMessageNumber = perfData.FirstRedirectionMessageNumber +
-                                                            adaptExt->num_queues - 1;
-                    ASSERT(perfData.lastRedirectionMessageNumber < adaptExt->num_affinity);
-                }
-                if (CHECKFLAG(perfData.Flags, STOR_PERF_CONCURRENT_CHANNELS))
-                {
-                    adaptExt->perfFlags |= STOR_PERF_CONCURRENT_CHANNELS;
-                    perfData.ConcurrentChannels = adaptExt->num_queues;
-                }
-                if ((adaptExt->pmsg_affinity != NULL) && CHECKFLAG(perfData.Flags, STOR_PERF_ADV_CONFIG_LOCALITY))
-                {
-                    RtlZeroMemory((PCHAR)adaptExt->pmsg_affinity,
-                                  sizeof(GROUP_AFFINITY) * ((ULONGLONG)adaptExt->num_queues + 1));
-                    adaptExt->perfFlags |= STOR_PERF_ADV_CONFIG_LOCALITY;
-                    perfData.MessageTargets = adaptExt->pmsg_affinity;
-                }
-                if (CHECKFLAG(perfData.Flags, STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO))
-                {
-                    adaptExt->perfFlags |= STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO;
-                }
-                if (CHECKFLAG(perfData.Flags, STOR_PERF_NO_SGL))
-                {
-                    adaptExt->perfFlags |= STOR_PERF_NO_SGL;
-                }
-                perfData.Flags = adaptExt->perfFlags;
-                RhelDbgPrint(TRACE_LEVEL_VERBOSE,
-                             " Perf Version = 0x%x, Flags = 0x%x, ConcurrentChannels = %d, "
-                             "FirstRedirectionMessageNumber = %d,LastRedirectionMessageNumber = %d\n",
-                             perfData.Version,
-                             perfData.Flags,
-                             perfData.ConcurrentChannels,
-                             perfData.FirstRedirectionMessageNumber,
-                             perfData.LastRedirectionMessageNumber);
-                status = StorPortInitializePerfOpts(DeviceExtension, FALSE, &perfData);
-                if (status != STOR_STATUS_SUCCESS)
-                {
-                    adaptExt->perfFlags = 0;
-                    RhelDbgPrint(TRACE_LEVEL_ERROR, " StorPortInitializePerfOpts FALSE status = 0x%x\n", status);
-                }
-            }
-            else
-            {
-                RhelDbgPrint(TRACE_LEVEL_INFORMATION, " StorPortInitializePerfOpts TRUE status = 0x%x\n", status);
-            }
-        }
-    }
-
-    if (!adaptExt->dump_mode)
-    {
-        if (adaptExt->dpc == NULL)
-        {
-            adaptExt->dpc = (PSTOR_DPC)VioStorPoolAlloc(DeviceExtension, sizeof(STOR_DPC) * adaptExt->num_queues);
-        }
-        if ((adaptExt->dpc != NULL) && (adaptExt->dpc_ok == FALSE))
-        {
-            ret = StorPortEnablePassiveInitialization(DeviceExtension, VirtIoPassiveInitializeRoutine);
-        }
-    }
-
-    if (ret)
-    {
-        virtio_device_ready(&adaptExt->vdev);
-    }
-    else
-    {
-        virtio_add_status(&adaptExt->vdev, VIRTIO_CONFIG_S_FAILED);
-    }
-
-    for (ULONG index = 0; index < adaptExt->num_queues; ++index)
-    {
-        element = &adaptExt->processing_srbs[index];
-        InitializeListHead(&element->srb_list);
-        element->srb_cnt = 0;
-    }
-
-    return ret;
+    return TRUE;
 }
 
 VOID CompletePendingRequests(IN PVOID DeviceExtension)
@@ -2090,7 +2729,7 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
 {
     unsigned int len = 0;
     PADAPTER_EXTENSION adaptExt = NULL;
-    ULONG QueueNumber = MessageID - 1;
+    ULONG QueueNumber = MessageID - VIRTIO_BLK_MSIX_VQ_OFFSET;
     STOR_LOCK_HANDLE queueLock = {0};
     struct virtqueue *vq = NULL;
     pblk_req vbr = NULL;
