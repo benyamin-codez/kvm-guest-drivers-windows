@@ -125,7 +125,7 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
                                               srbExt->psgl,
                                               srbExt->out,
                                               srbExt->in,
-                                              (void *)srbExt->id,
+                                              &srbExt->cmd,
                                               va,
                                               pa);
 
