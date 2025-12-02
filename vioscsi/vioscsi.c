@@ -829,6 +829,39 @@ VioScsiHwReinitialize(IN PVOID DeviceExtension)
     return VioScsiHwInitialize(DeviceExtension);
 }
 
+/*
+ * Atomically allocate a unique SRB ID.
+ * Semantics preserved from 1bbc422:
+ *  - The ID returned for the current SRB is the *old* counter value.
+ *  - We advance the stored counter and skip over 0 and the TMF SRB cmd address
+ *    (those checks apply to the *next* value).
+ *
+ * Uses InterlockedCompareExchangePointer for pointer-sized atomics on both x86/x64.
+ */
+static ULONG_PTR FORCEINLINE VioScsiAllocSrbId(_Inout_ PADAPTER_EXTENSION adaptExt)
+{
+    for (;;)
+    {
+        /* Snapshot current and compute the next candidate(s) */
+        ULONG_PTR old  = (ULONG_PTR)adaptExt->last_srb_id;
+        ULONG_PTR id   = old;        /* to be returned for this SRB */
+        ULONG_PTR next = old + 1;    /* value to store back */
+
+        /* Preserve original "skip on the next value" rules */
+        if (next == 0 ||
+            (adaptExt->tmf_cmd.SrbExtension &&
+             next == (ULONG_PTR)&adaptExt->tmf_cmd.SrbExtension->cmd))
+        {
+            next++;
+        }
+
+        /* Try to publish 'next'; if someone raced us, retry */
+        if (InterlockedCompareExchangePointer((PVOID*)&adaptExt->last_srb_id,
+                                              (PVOID)next, (PVOID)old) == (PVOID)old)
+            return id;
+    }
+}
+
 BOOLEAN
 VioScsiStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 {
@@ -842,13 +875,7 @@ VioScsiStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
         PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
 
-        srbExt->id = adaptExt->last_srb_id;
-        adaptExt->last_srb_id++;
-        if (adaptExt->last_srb_id == 0 || (adaptExt->tmf_cmd.SrbExtension &&
-                                           adaptExt->last_srb_id == (ULONG_PTR)&adaptExt->tmf_cmd.SrbExtension->cmd))
-        {
-            adaptExt->last_srb_id++;
-        }
+        srbExt->id = VioScsiAllocSrbId(adaptExt);
 
         SendSRB(DeviceExtension, (PSRB_TYPE)Srb);
     }

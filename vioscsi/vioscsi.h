@@ -353,7 +353,7 @@ typedef struct _ADAPTER_EXTENSION
     ULONGLONG fw_ver;
     ULONG resp_time;
     BOOLEAN bRemoved;
-    ULONG_PTR last_srb_id;
+    volatile ULONG_PTR last_srb_id; /* atomically updated, see VioScsiAllocSrbId() */
 } ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
 
 #ifndef PCIX_TABLE_POINTER
