@@ -120,6 +120,43 @@ VOID SendSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     vq_req_idx = QueueNumber - VIRTIO_SCSI_REQUEST_QUEUE_0;
 
     VioScsiVQLock(DeviceExtension, MessageId, &LockHandle, FALSE);
+
+    //
+    // Per-queue SRB ID allocation under the queue lock.
+    // We keep the same "skip 0 and tmf_cmd.SrbExtension->cmd" rules as 1bbc422,
+    // but now the counter lives in processing_srbs[vq_req_idx].
+    //
+    element = &adaptExt->processing_srbs[vq_req_idx];
+    {
+        ULONG_PTR id = element->last_srb_id;
+
+        //
+        // element->last_srb_id is zeroed at adapter init by RtlZeroMemory.
+        // Treat 0 as "not yet initialized" and bump it to 1. Also skip
+        // the TMF SRB cmd address just like the original code.
+        //
+        if (id == 0 ||
+            (adaptExt->tmf_cmd.SrbExtension &&
+             id == (ULONG_PTR)&adaptExt->tmf_cmd.SrbExtension->cmd))
+        {
+            ++id;
+
+            // In the pathological wrap / double-collision case, bump again.
+            if (id == 0 ||
+                (adaptExt->tmf_cmd.SrbExtension &&
+                 id == (ULONG_PTR)&adaptExt->tmf_cmd.SrbExtension->cmd))
+            {
+                ++id;
+            }
+        }
+
+        //
+        // Publish the "next" counter value and remember the ID in the SRB.
+        //
+        element->last_srb_id = id + 1;
+        srbExt->id = id;
+    }
+
     SET_VA_PA();
     add_buffer_req_status = virtqueue_add_buf(adaptExt->vq[QueueNumber],
                                               srbExt->psgl,
