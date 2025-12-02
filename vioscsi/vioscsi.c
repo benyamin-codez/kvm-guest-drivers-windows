@@ -842,6 +842,11 @@ VioScsiStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
         PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
 
+        // Serialize cookie reservation: StartIo can run concurrently in FullDuplex.
+        // Use StartIoLock for this tiny critical section (permitted in HwStorStartIo).
+        STOR_LOCK_HANDLE startIoLock;
+        StorPortAcquireSpinLock(DeviceExtension, StartIoLock, NULL, &startIoLock);
+
         srbExt->id = adaptExt->last_srb_id;
         adaptExt->last_srb_id++;
         if (adaptExt->last_srb_id == 0 || (adaptExt->tmf_cmd.SrbExtension &&
@@ -849,6 +854,8 @@ VioScsiStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         {
             adaptExt->last_srb_id++;
         }
+
+        StorPortReleaseSpinLock(DeviceExtension, &startIoLock);
 
         SendSRB(DeviceExtension, (PSRB_TYPE)Srb);
     }
