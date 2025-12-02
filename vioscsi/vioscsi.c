@@ -842,13 +842,33 @@ VioScsiStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
         PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
 
-        srbExt->id = adaptExt->last_srb_id;
-        adaptExt->last_srb_id++;
-        if (adaptExt->last_srb_id == 0 || (adaptExt->tmf_cmd.SrbExtension &&
-                                           adaptExt->last_srb_id == (ULONG_PTR)&adaptExt->tmf_cmd.SrbExtension->cmd))
-        {
-            adaptExt->last_srb_id++;
-        }
+       ULONG_PTR id = 0; // Init
+
+       for (;;) // Loop start
+       {
+           ULONG_PTR old = (ULONG_PTR)adaptExt->last_srb_id;
+
+           id = old; /* to be returned for this SRB */
+
+           ULONG_PTR next = old + 1; /* value to store back */
+
+           if (next == 0 ||
+               (adaptExt->tmf_cmd.SrbExtension &&
+                next == (ULONG_PTR)&adaptExt->tmf_cmd.SrbExtension->cmd))
+            {
+               next++;
+            }
+
+           if (InterlockedCompareExchangePointer(
+                   (PVOID*)&adaptExt->last_srb_id,
+                   (PVOID)next, (PVOID)old) == (PVOID)old)
+           {
+               break; // Success
+           }
+           // else: somebody raced us, retry with new last_srb_id
+       } // Loop end
+
+       srbExt->id = id; // Final SRB ID assignment
 
         SendSRB(DeviceExtension, (PSRB_TYPE)Srb);
     }
