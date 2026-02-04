@@ -87,7 +87,7 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 
 #define VIRTIO_BLK_QUEUE_LAST              MAX_CPU
 
-#define VIRTIO_BLK_MSIX_CONFIG_VECTOR      0
+#define VIRTIO_STOR_MSIX_CONFIG_VECTOR     0
 #define MIN_DISCARD_SECTOR_ALIGNMENT       8
 
 #define BLOCK_SERIAL_STRLEN                20
@@ -287,9 +287,6 @@ typedef struct _SRB_EXTENSION
     VRING_DESC_ALIAS desc[VIRTIO_MAX_SG];
     blk_discard_write_zeroes blk_discard[MAX_DISCARD_SEGMENTS];
 } SRB_EXTENSION, *PSRB_EXTENSION;
-
-BOOLEAN
-VirtIoInterrupt(IN PVOID DeviceExtension);
 
 #ifndef PCIX_TABLE_POINTER
 typedef struct

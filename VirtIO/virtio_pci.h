@@ -92,7 +92,9 @@
 
 #endif /* VIRTIO_PCI_NO_LEGACY */
 
-/* The bit of the ISR which indicates a device configuration change. */
+/* The bit of the ISR Status register which indicates a queue IRQ. */
+#define VIRTIO_PCI_ISR_QUEUE      0x1
+/* The bit of the ISR Status register which indicates a device configuration change IRQ. */
 #define VIRTIO_PCI_ISR_CONFIG     0x2
 /* Vector value used to disable MSI for queue */
 #define VIRTIO_MSI_NO_VECTOR      0xffff
