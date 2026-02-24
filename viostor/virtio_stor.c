@@ -68,12 +68,23 @@ VirtIoHwReinitialize(IN PVOID DeviceExtension);
 BOOLEAN
 VirtIoBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
 
-VOID CompleteDpcRoutine(IN PSTOR_DPC Dpc, IN PVOID Context, IN PVOID SystemArgument1, IN PVOID SystemArgument2);
-BOOLEAN
-VirtIoMSInterruptRoutine(IN PVOID DeviceExtension, IN ULONG MessageID);
-
 BOOLEAN
 VirtIoStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
+
+BOOLEAN
+VirtIoProcessConfigChange(IN PVOID DeviceExtension);
+
+BOOLEAN
+VirtIoInterrupt(IN PVOID DeviceExtension);
+
+BOOLEAN
+VirtIoMSInterruptRoutine(IN PVOID DeviceExtension, IN ULONG MessageId);
+
+static BOOLEAN VirtIoScsiMSISRWorker(IN PVOID DeviceExtension, IN ULONG MessageId);
+
+static BOOLEAN VirtIoBlkMSISRWorker(IN PVOID DeviceExtension, IN ULONG MessageId);
+
+VOID CompleteDpcRoutine(IN PSTOR_DPC Dpc, IN PVOID Context, IN PVOID SystemArgument1, IN PVOID SystemArgument2);
 
 ULONG
 VirtIoFindAdapter(IN PVOID DeviceExtension,
@@ -108,7 +119,9 @@ RhelScsiReportLuns(IN PVOID DeviceExtension, IN OUT PSRB_TYPE Srb);
 
 VOID FORCEINLINE CompleteSRB(IN PVOID DeviceExtension, IN PSRB_TYPE Srb);
 
-VOID FORCEINLINE DeviceChangeNotification(IN PVOID DeviceExtension, IN BOOLEAN bLun);
+ULONG
+FORCEINLINE
+DeviceChangeNotification(IN PVOID DeviceExtension, IN BOOLEAN bLun);
 
 BOOLEAN
 FORCEINLINE
@@ -1041,8 +1054,8 @@ VirtIoStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
                         break;
                     case StorRemoveDevice:
                     case StorSurpriseRemoval:
-                        adaptExt->removed = TRUE;
-                        DeviceChangeNotification(DeviceExtension, FALSE);
+                        ULONG status = DeviceChangeNotification(DeviceExtension, FALSE);
+                        adaptExt->removed = (status == STOR_STATUS_SUCCESS);
                         break;
                     case StorStopDevice:
                         adaptExt->stopped = TRUE;
@@ -1243,44 +1256,191 @@ VirtIoStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 }
 
 BOOLEAN
-VirtIoInterrupt(IN PVOID DeviceExtension)
+VirtIoProcessConfigChange(PVOID DeviceExtension)
 {
-    PADAPTER_EXTENSION adaptExt;
-    BOOLEAN isInterruptServiced = FALSE;
-    ULONG intReason = 0;
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
 
-    adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    RhelGetDiskGeometry(adaptExt);
+    adaptExt->sense_info.senseKey = SCSI_SENSE_UNIT_ATTENTION;
+    adaptExt->sense_info.additionalSenseCode = SCSI_ADSENSE_PARAMETERS_CHANGED;
+    adaptExt->sense_info.additionalSenseCodeQualifier = SCSI_SENSEQ_CAPACITY_DATA_CHANGED;
+    adaptExt->check_condition = TRUE;
+    ULONG status = DeviceChangeNotification(adaptExt, TRUE);
+    return (status == STOR_STATUS_SUCCESS);
+}
 
-    RhelDbgPrint(TRACE_LEVEL_VERBOSE, " IRQL (%d)\n", KeGetCurrentIrql());
+BOOLEAN
+VirtIoInterrupt(PVOID DeviceExtension)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    BOOLEAN irq_serviced = FALSE;
+    UCHAR isr_status;
+
     if (adaptExt->removed == TRUE || adaptExt->stopped == TRUE)
     {
-        RhelDbgPrint(TRACE_LEVEL_ERROR, " Interrupt on removed or stopped device)");
-        return FALSE;
+        RhelDbgPrint(TRACE_LEVEL_ERROR, " Interrupt on removed or stopped device...! IRQL : %d \n", KeGetCurrentIrql());
+        return irq_serviced;
     }
-    intReason = virtio_read_isr_status(&adaptExt->vdev);
-    if (intReason == 1 || adaptExt->dump_mode)
+
+    isr_status = virtio_read_isr_status(&adaptExt->vdev);
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                 " ISR Status register reveals : %s IRQ | IRQL : %d \n",
+                 isr_status & VIRTIO_PCI_ISR_CONFIG ? "Device Configuration" : "Queue",
+                 KeGetCurrentIrql());
+
+    if (isr_status & VIRTIO_PCI_ISR_QUEUE || adaptExt->dump_mode)
     {
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE, " Dispatching request to DPC Queue... \n");
         if (!CompleteDPC(DeviceExtension, adaptExt->msix_has_config_vector))
         {
             VioStorCompleteRequest(DeviceExtension, adaptExt->msix_has_config_vector, TRUE);
         }
-        isInterruptServiced = TRUE;
+        irq_serviced = TRUE;
     }
-    else if (intReason == 3)
+
+    if (isr_status & VIRTIO_PCI_ISR_CONFIG && !adaptExt->dump_mode)
     {
-        RhelGetDiskGeometry(DeviceExtension);
-        isInterruptServiced = TRUE;
-        adaptExt->sense_info.senseKey = SCSI_SENSE_UNIT_ATTENTION;
-        adaptExt->sense_info.additionalSenseCode = SCSI_ADSENSE_PARAMETERS_CHANGED;
-        adaptExt->sense_info.additionalSenseCodeQualifier = SCSI_SENSEQ_CAPACITY_DATA_CHANGED;
-        adaptExt->check_condition = TRUE;
-        DeviceChangeNotification(DeviceExtension, TRUE);
+        RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Processing Device Configuration Change IRQ...\n");
+        irq_serviced = VirtIoProcessConfigChange(DeviceExtension);
     }
-    if (!isInterruptServiced)
+
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE, " IRQ serviced : %s \n", (irq_serviced) ? "YES" : "NO");
+
+    return irq_serviced;
+}
+
+static BOOLEAN VirtIoScsiMSISRWorker(PVOID DeviceExtension, ULONG MessageId)
+{
+    /* TODO
+     * Placeholder should vioscsi consolidation occur.
+     * Allows compilation to occur.
+     */
+    return TRUE;
+}
+
+static BOOLEAN VirtIoBlkMSISRWorker(PVOID DeviceExtension, ULONG MessageId)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    BOOLEAN irq_serviced = FALSE;
+
+    if (MessageId != VIRTIO_STOR_MSIX_CONFIG_VECTOR)
     {
-        RhelDbgPrint(TRACE_LEVEL_ERROR, " was not serviced ISR status = %d\n", intReason);
+        /*
+         * We put the common case first:
+         * A queue vector in a system with a dedicated device configuration change vector
+         */
+        RhelDbgPrint(TRACE_LEVEL_VERBOSE, " Dispatching request to DPC Queue for MessageId : %d \n", MessageId);
+        if (!CompleteDPC(DeviceExtension, MessageId))
+        {
+            VioStorCompleteRequest(DeviceExtension, MessageId, TRUE);
+        }
+        irq_serviced = TRUE;
     }
-    return isInterruptServiced;
+    else
+    {
+        /*
+         * The uncommon case:
+         * A device configuration change vector OR a shared vector for queue and device configuration change operations
+         */
+        if (adaptExt->msix_has_config_vector)
+        {
+            /* In the case that we have a dedicated device configuration change vector, process the IRQs. */
+            RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Processing Device Configuration Change IRQ...\n");
+            irq_serviced = VirtIoProcessConfigChange(DeviceExtension);
+        }
+        else
+        {
+            /*
+             * If we don't have a dedicated device configuration change vector, first we need to check the ISR Status
+             * register. This is required otherwise we have no way of knowing whether to process device configuration
+             * changes or queues.
+             */
+            UCHAR isr_status = virtio_read_isr_status(&adaptExt->vdev);
+            RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                         " Running single MSI-X vector - ISR Status register reveals : %s IRQ \n",
+                         isr_status & VIRTIO_PCI_ISR_CONFIG ? "Device Configuration" : "Queue");
+            /*
+             * Process queue IRQs first to complete outstanding SRBs before processing device configuration change IRQs.
+             * The VIRTIO_PCI_ISR_QUEUE bit is typically always set in the ISR Status register.
+             */
+            if (isr_status & VIRTIO_PCI_ISR_QUEUE)
+            {
+                RhelDbgPrint(TRACE_LEVEL_VERBOSE, " Dispatching request to DPC Queue for MessageId : %d \n", MessageId);
+                if (!CompleteDPC(DeviceExtension, MessageId))
+                {
+                    VioStorCompleteRequest(DeviceExtension, MessageId, TRUE);
+                }
+                irq_serviced = TRUE;
+            }
+            /* Process device configuration change IRQs. */
+            if (isr_status & VIRTIO_PCI_ISR_CONFIG)
+            {
+                RhelDbgPrint(TRACE_LEVEL_INFORMATION, " Processing Device Configuration Change IRQ...\n");
+                irq_serviced = VirtIoProcessConfigChange(DeviceExtension);
+            }
+        }
+    }
+
+    return irq_serviced;
+}
+
+BOOLEAN
+VirtIoMSInterruptRoutine(PVOID DeviceExtension, ULONG MessageId)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    BOOLEAN irq_serviced = FALSE;
+    VIRTIO_DRIVER_TYPE virtio_driver = VIRTIO_BLK_DRIVER;
+
+    // TODO : vioscsi only uses bRemoved. Some consolidation required...
+    if (MessageId > adaptExt->num_queues || adaptExt->removed == TRUE || adaptExt->stopped == TRUE)
+    {
+        RhelDbgPrint(TRACE_LEVEL_ERROR,
+                     " Adapter has been removed. Returning without servicing IRQ. MessageId : %d\n",
+                     MessageId);
+        return irq_serviced;
+    }
+
+    if (virtio_driver == VIRTIO_BLK_DRIVER)
+    {
+        irq_serviced = VirtIoBlkMSISRWorker(DeviceExtension, MessageId);
+    }
+    else if (virtio_driver == VIRTIO_SCSI_DRIVER)
+    {
+        if (adaptExt->msix_has_config_vector)
+        {
+            /* Each queue has its own vector, this is the fast and common case */
+            irq_serviced = VirtIoScsiMSISRWorker(DeviceExtension, MessageId);
+        }
+        else
+        {
+            /*
+             * If we don't have a dedicated device configuration change vector then we need to specifically
+             * check virtqueues 1 to 3 (virtqueue index 0 to 2) to check if we have outstanding buffers for
+             * the controlq, eventq and requestq. This is especially needed during boot-time to avoid BSOD.
+             **
+             * TODO : Replace numeric values with constants:
+             *        * vq_idx = VIRTIO_SCSI_CONTROL_QUEUE for the starting index
+             *        * adaptExt->num_queues + VIRTIO_SCSI_REQUEST_QUEUE_0 for the upper bound
+             *        ... or refactor num_queues to include the upper limit and remove
+             *            VIRTIO_SCSI_REQUEST_QUEUE_0 when necessary
+             *        The numeric equivalent is:
+             *        for (ULONG vq_idx = 0; vq_idx <= 2; vq_idx++)
+             */
+            for (ULONG vq_idx = 0; vq_idx < adaptExt->num_queues + 2; vq_idx++)
+            {
+                if (virtqueue_has_buf(adaptExt->vq[vq_idx]))
+                {
+                    irq_serviced |= VirtIoScsiMSISRWorker(DeviceExtension, vq_idx + 1);
+                }
+            }
+        }
+    }
+
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                 " IRQ serviced : %s | MessageId : %d \n",
+                 (irq_serviced) ? "YES" : "NO",
+                 MessageId);
+    return irq_serviced;
 }
 
 BOOLEAN
@@ -1388,7 +1548,8 @@ VirtIoHwReinitialize(IN PVOID DeviceExtension)
         adaptExt->sense_info.additionalSenseCode = SCSI_ADSENSE_WRITE_PROTECT;
         adaptExt->sense_info.additionalSenseCodeQualifier = SCSI_SENSEQ_SPACE_ALLOC_FAILED_WRITE_PROTECT; // SCSI_ADSENSE_NO_SENSE;
         adaptExt->check_condition = TRUE;
-        DeviceChangeNotification(DeviceExtension, TRUE);
+        ULONG status = DeviceChangeNotification(DeviceExtension, TRUE);
+        return (status == STOR_STATUS_SUCCESS);
     }
     return TRUE;
 }
@@ -1570,36 +1731,6 @@ VirtIoBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 
     srbExt->sg[sgElement].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &dummy);
     srbExt->sg[sgElement].length = sizeof(srbExt->vbr.status);
-
-    return TRUE;
-}
-
-BOOLEAN
-VirtIoMSInterruptRoutine(IN PVOID DeviceExtension, IN ULONG MessageID)
-{
-    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-
-    if (MessageID > adaptExt->num_queues || adaptExt->removed == TRUE || adaptExt->stopped == TRUE)
-    {
-        RhelDbgPrint(TRACE_LEVEL_ERROR, " MessageID = %d\n", MessageID);
-        return FALSE;
-    }
-
-    if (adaptExt->msix_has_config_vector && MessageID == VIRTIO_BLK_MSIX_CONFIG_VECTOR)
-    {
-        RhelGetDiskGeometry(DeviceExtension);
-        adaptExt->sense_info.senseKey = SCSI_SENSE_UNIT_ATTENTION;
-        adaptExt->sense_info.additionalSenseCode = SCSI_ADSENSE_PARAMETERS_CHANGED;
-        adaptExt->sense_info.additionalSenseCodeQualifier = SCSI_SENSEQ_CAPACITY_DATA_CHANGED;
-        adaptExt->check_condition = TRUE;
-        DeviceChangeNotification(DeviceExtension, TRUE);
-        return TRUE;
-    }
-
-    if (!CompleteDPC(DeviceExtension, MessageID))
-    {
-        VioStorCompleteRequest(DeviceExtension, MessageID, TRUE);
-    }
 
     return TRUE;
 }
@@ -2064,16 +2195,18 @@ VOID CompleteRequestWithStatus(IN PVOID DeviceExtension, IN PSRB_TYPE Srb, IN UC
     CompleteSRB(DeviceExtension, Srb);
 }
 
-VOID FORCEINLINE DeviceChangeNotification(IN PVOID DeviceExtension, IN BOOLEAN bLun)
+ULONG
+FORCEINLINE
+DeviceChangeNotification(PVOID DeviceExtension, BOOLEAN bLun)
 {
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    StorPortStateChangeDetected(DeviceExtension,
-                                bLun ? STATE_CHANGE_LUN : STATE_CHANGE_BUS,
-                                (PSTOR_ADDRESS)&adaptExt->device_address,
-                                0,
-                                NULL,
-                                NULL);
     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " StorPortStateChangeDetected.\n");
+    return StorPortStateChangeDetected(DeviceExtension,
+                                       bLun ? STATE_CHANGE_LUN : STATE_CHANGE_BUS,
+                                       (PSTOR_ADDRESS)&adaptExt->device_address,
+                                       0,
+                                       NULL,
+                                       NULL);
 }
 
 BOOLEAN
